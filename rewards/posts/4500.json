@@ -1,0 +1,8 @@
+[
+    { "postsCount": 30, "groceryCoupons": 2000, "shares": 20,  "referralToken": 0 },
+    { "postsCount": 70, "groceryCoupons": 2000, "shares": 20,  "referralToken": 0 },
+    { "postsCount": 150, "groceryCoupons": 2000, "shares": 20,  "referralToken": 0 },
+    { "postsCount": 300, "groceryCoupons": 2500, "shares": 40,  "referralToken": 0 },
+    { "postsCount": 600, "groceryCoupons": 3000, "shares": 40,  "referralToken": 0 },
+    { "postsCount": 1000, "groceryCoupons": 3500, "shares": 40,  "referralToken": 0 }
+  ]

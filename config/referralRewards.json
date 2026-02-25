@@ -1,0 +1,26 @@
+[
+    { "referralCount": 3, "groceryCoupons": 2500, "shares": 10, "referralToken": 300 },
+    { "referralCount": 6, "groceryCoupons": 2500, "shares": 20, "referralToken": 300 },
+    { "referralCount": 10, "groceryCoupons": 3000, "shares": 40, "referralToken": 400 },
+    { "referralCount": 11, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 12, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 13, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 14, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 15, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 16, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 17, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 18, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 19, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 20, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 21, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 22, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 23, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 24, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 25, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 26, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 27, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 28, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 29, "groceryCoupons": 0, "shares": 0, "referralToken": 200 },
+    { "referralCount": 30, "groceryCoupons": 0, "shares": 0, "referralToken": 200 }
+  ]
+  
