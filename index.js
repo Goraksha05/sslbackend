@@ -1,11 +1,10 @@
-require('dotenv').config({ quiet: true });
-require('./jobs/streakReminderJob');
-require('./jobs/subscriptionReminderJob');
-require("./models/User");
-require("./models/Notification");
+require('dotenv').config();
 
-// const connectToMongo = require ('./database');
-const express = require('express')
+// ⚠️ Jobs are started AFTER the DB connects (see mongoose.connect().then below).
+// Removed pre-emptive require() here to avoid scheduling DB queries before
+// Mongoose is ready. Models are loaded on-demand by the routes that need them.
+
+const express = require('express');
 const mongoose = require('mongoose');
 const path = require('path');
 const cors = require('cors');
@@ -13,23 +12,60 @@ const http = require('http');
 const cloudinary = require('cloudinary').v2;
 const cookieParser = require('cookie-parser');
 
-// connectToMongo();
-// copy this boilerPlate from express.js website
-const app = express()
-const PORT = process.env.PORT || 5001;
+const PORT = process.env.PORT || 5000;
+
+// ✅ Use IOsocket.js as the single entry point for socket initialization
+const { initializeSocket, getIO } = require("./sockets/IOsocket");
+
+// Initialize Express
+const app = express();
+const server = http.createServer(app);
+
+// ==========================================
+// SOCKET.IO CONFIGURATION
+// ==========================================
+
+// initializeSocket handles Server creation, CORS, middleware, and all handlers internally
+initializeSocket(server);
+
+// Make io accessible in routes
+app.use((req, res, next) => {
+  req.io = getIO();
+  next();
+});
 
 // ----------------------------------
 // ✅ CORS Setup
 // ----------------------------------
-app.use(cors({
-  origin: [
+const ALLOWED_ORIGINS = (process.env.FRONTEND_BASE_URL || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean)
+  .concat([
     'http://localhost:3000',
+    'http://127.0.0.1:3000',
     'https://sosholife.com',
     'https://www.sosholife.com'
-  ],
+  ]);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests with no origin (e.g. mobile apps, curl, Postman)
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`🚫 CORS blocked origin: ${origin}`);
+      callback(new Error(`CORS policy: origin ${origin} not allowed`));
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  credentials: true
-}));
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token', 'user-id'],
+  credentials: true,
+};
+
+// Handle preflight OPTIONS requests for ALL routes before any other middleware
+app.options('/{*path}', cors(corsOptions));
+app.use(cors(corsOptions));
 
 app.use(cookieParser());
 
@@ -41,7 +77,6 @@ app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 // ----------------------------------
 // ✅ Serve /uploads/ as static folder
-//     This makes /uploads/profiles/ accessible
 // ----------------------------------
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
@@ -50,16 +85,22 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // ----------------------------------
 console.log('⏳ Attempting MongoDB connection...');
 mongoose.connect(process.env.MONGO_URI, {
-  connectTimeoutMS: 5000, // force error after 5 seconds if not connected
+  connectTimeoutMS: 5000,
 })
-  .then(() => console.log("✅ MongoDB connected"))
-  .catch(err => console.error("❌ MongoDB error:", err));
+  .then(() => {
+    console.log('✅ MongoDB connected');
+    // FIX: Start scheduled jobs AFTER DB connects — they may query the DB on
+    // their first tick, so they must not run before Mongoose is ready.
+    require('./jobs/streakReminderJob');
+    require('./jobs/subscriptionReminderJob');
+  })
+  .catch(err => console.error('❌ MongoDB error:', err));
 
 // ----------------------------------
-// ✅ Cloudinary config (optional: only if needed)
+// ✅ Cloudinary config
 // ----------------------------------
 cloudinary.config({
-  cloud_name: 'dbpsyvmx8',
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'dbpsyvmx8',
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
@@ -81,18 +122,21 @@ app.use('/api/friends', require('./routes/friends'));
 app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/payment', require('./routes/payment'));
 app.use('/api/rewards', require('./routes/userRewardSlabs'));
+app.use('/api/auth', require('./routes/earnedRewards'));
 
-app.use('/api/admin', require('./routes/adminRewards'));
-app.use('/api/admin', require('./routes/adminRoutes'));
+// FIX: Merge both admin route files under a single router to avoid
+// potential ordering ambiguity when both define overlapping middleware.
+const adminRouter = require('express').Router();
+adminRouter.use(require('./routes/adminRewards'));
+adminRouter.use(require('./routes/adminRoutes'));
+app.use('/api/admin', adminRouter);
 
 app.use('/api/upload', require('./routes/upload'));
 app.use('/api/chat', require('./routes/chat'));
 app.use('/api/message', require('./routes/message'));
 
 app.use('/api', require('./routes/search'));
-
 app.use('/api/push', require('./routes/push'));
-
 
 // ----------------------------------
 // ✅ Error Handling Middleware
@@ -107,13 +151,6 @@ app.use((err, req, res, next) => {
   }
   res.status(500).json({ message: 'Something went wrong on the server.' });
 });
-
-// ----------------------------------
-// ✅ Socket.IO Init
-// ----------------------------------
-const server = http.createServer(app);
-const { initializeSocket } = require('./sockets/IOsocket');
-initializeSocket(server);
 
 // ----------------------------------
 // ✅ Start Server

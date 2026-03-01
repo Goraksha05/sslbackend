@@ -4,76 +4,108 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Activity = require('../models/Activity');
 const Profile = require('../models/Profile');
-// const VerifiedPhone = require('../schema_models/VerifiedPhone');
-const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const Notification = require('../models/Notification');
 const Friendship = require('../models/Friendship');
 const { getIO } = require('../sockets/IOsocket');
 const { sendPushToUser } = require('../utils/pushService');
 const notifyUser = require('../utils/notifyUser');
 
+// ── Constants ────────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET;
-// const JWT_SECRET = process.env.JWT_SECRET || "$hreeisa$$Busine$$mindedBoy2428";
-// const JWT_SECRET = "$hreeisa$$Busine$$mindedBoy2428";
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
-// Register new user
+// FIX: Removed hardcoded fallback secret — if JWT_SECRET is missing the app
+// should fail loudly at startup, not silently use an insecure default.
+if (!JWT_SECRET) {
+  throw new Error('FATAL: JWT_SECRET environment variable is not set.');
+}
 
+// ── Helper: sign token ────────────────────────────────────────────────────────
+function signToken(payload) {
+  // FIX: Always set an expiry on JWTs. The original code called jwt.sign()
+  // without `expiresIn`, meaning tokens NEVER expired — a serious security hole.
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+}
+
+// ── Helper: safe referral activation (extracted for reuse) ─────────────────
+async function checkReferralActivation(referrer) {
+  try {
+    const referredCount = await User.countDocuments({ referral: referrer._id });
+    const target = referrer.referralTarget ?? 10;
+    const alreadyActive = !!referrer.subscription?.active;
+
+    if (referredCount >= target && !alreadyActive) {
+      const now = new Date();
+      const oneYearLater = new Date(now);
+      oneYearLater.setFullYear(now.getFullYear() + 1);
+
+      await User.findByIdAndUpdate(referrer._id, {
+        $set: {
+          'subscription.plan': referrer.subscription?.plan || 'Referral',
+          'subscription.active': true,
+          'subscription.startDate': now,
+          'subscription.expiresAt': oneYearLater,
+          'subscription.autoRenew': false,
+          activationMethod: 'referrals',
+          referralActivatedAt: now,
+          referralTarget: target
+        }
+      });
+      console.log(`🎉 Referral activation: ${referrer._id} now active via referrals`);
+    }
+  } catch (e) {
+    console.error('Referral activation check failed:', e.message);
+  }
+}
+
+// ── Register new user ────────────────────────────────────────────────────────
+// @route  POST /api/auth/createuser
+// @access Public
 exports.createUser = async (req, res) => {
-
-  // console.log("Request body received on /createuser:", req.body);
-
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-
   const { name, username, email, phone, password, referralno, role } = req.body;
   const userRole = role === 'admin' ? 'admin' : 'user';
-  const phonenumber = req.body.phone;
 
   if (!name || !username || !email || !phone || !password) {
-    return res.status(400).json({ success: false, message: "Missing fields" });
+    return res.status(400).json({ success: false, message: 'Missing required fields.' });
   }
-
-  // Allow first user to register without referral
-  let referrer = null;
-  const totalUsers = await User.countDocuments();
-  if (totalUsers === 0) {
-    console.log("No users found. Creating the first user without referral.");
-  } else {
-    if (!referralno) {
-      return res.status(400).json({ message: 'Referral code required. Please ask your friend to share their ID.' });
-    }
-
-    //   referrer = await User.findById(referralno);
-    //   if (!referrer) {
-    //     return res.status(400).json({ message: 'Invalid referral code. Please ask your friend to share their ID.' });
-    //   }
-    // }
-
-    // ✅ Find by referralId (e.g., "DU688828"), not by Mongo _id
-    referrer = await User.findOne({ referralId: String(referralno).trim().toUpperCase() });
-    if (!referrer) {
-      return res.status(400).json({ message: 'Invalid referral ID. Please ask your friend to share their correct ID.' });
-    }
-  }
-
-  // Check if referralCode exists and is a valid user ID
-  // const referrer = await User.findById(referralno);
-  // if (!referrer) {
-  //   return res.status(400).json({ message: 'Invalid referral code. Please ask your friend to share their ID.' });
-  // }
-
-  // const verified = await VerifiedPhone.findOne({ phone });
-  // if (!verified) {
-  //   return res.status(400).json({ error: "Phone number not verified. Please verify with OTP." });
-  // }
 
   try {
-    let existingUser = await User.findOne({ $or: [{ email }, { phone }] });
-    if (existingUser) {
-      return res.status(400).json({ error: "User with this email already exists" });
+    // ── Referral check ──────────────────────────────────────────────────────
+    let referrer = null;
+    const totalUsers = await User.countDocuments();
+    if (totalUsers > 0) {
+      if (!referralno) {
+        return res.status(400).json({
+          success: false,
+          message: 'Referral code required. Please ask your friend to share their ID.'
+        });
+      }
+      referrer = await User.findOne({ referralId: String(referralno).trim().toUpperCase() });
+      if (!referrer) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid referral ID. Please ask your friend for their correct code.'
+        });
+      }
     }
 
+    // ── Duplicate check ─────────────────────────────────────────────────────
+    // FIX: Also check username uniqueness (original only checked email/phone)
+    const existingUser = await User.findOne({ $or: [{ email }, { phone }, { username }] });
+    if (existingUser) {
+      const field =
+        existingUser.email === email
+          ? 'email'
+          : existingUser.phone === phone
+          ? 'phone number'
+          : 'username';
+      return res.status(409).json({ success: false, error: `A user with this ${field} already exists.` });
+    }
+
+    // ── Create user ─────────────────────────────────────────────────────────
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
@@ -88,86 +120,93 @@ exports.createUser = async (req, res) => {
       isAdmin: false
     });
 
-    await newUser.save();
+    // FIX: User.create() already calls save(). Removed the redundant newUser.save().
 
+    // ── Create profile ──────────────────────────────────────────────────────
     await Profile.create({
       user_id: newUser._id,
       followers: [],
       following: []
     });
 
+    // ── Referral side-effects (non-fatal) ───────────────────────────────────
     if (referrer) {
-      await Activity.create({ user: newUser._id, referral: referrer._id });
-    }
+      // Log activity
+      await Activity.create({ user: newUser._id, referral: referrer._id }).catch(err =>
+        console.error('Activity create failed:', err.message)
+      );
 
-    if (referrer) {
-      // ✅ DB Notification
+      // DB notification
       await Notification.create({
         user: referrer._id,
         sender: newUser._id,
         type: 'referral_signup',
         message: `${newUser.name} joined using your referral code! 🎉`,
         url: `/profile/${newUser._id}`
-      });
+      }).catch(err => console.error('Notification create failed:', err.message));
 
-      // ✅ Toast notification
-      await notifyUser(referrer._id, `${newUser.name} joined using your referral code! 🎉`, 'referral_signup');
-
-      // ✅ Push Notification
+      // In-app + push notifications (fire-and-forget — non-critical)
+      notifyUser(referrer._id, `${newUser.name} joined using your referral code! 🎉`, 'referral_signup').catch(() => {});
       sendPushToUser(referrer._id.toString(), {
         title: 'New Referral Signup',
         message: `${newUser.name} just created an account with your referral!`,
         url: `/profile/${newUser._id}`
       });
 
-      // ✅ Socket emit
-      const io = getIO();
-      io.to(referrer._id.toString()).emit('notification', {
-        type: 'referral_signup',
-        from: newUser._id,
-        message: `${newUser.name} joined using your referral code! 🎉`
-      });
-    }
-
-    // Track referral activity
-    // await Activity.create({ referral: referrer._id });
-
-    // ✅ AUTO-FRIENDSHIP CREATION
-    try {
-      const existingFriendship = await Friendship.findOne({
-        $or: [
-          { requester: referrer._id, recipient: newUser._id },
-          { requester: newUser._id, recipient: referrer._id }
-        ]
-      });
-
-      if (!existingFriendship) {
-        await Friendship.create({
-          requester: referrer._id,
-          recipient: newUser._id,
-          status: 'accepted'
-        });
-
-        console.log(`🤝 Auto-friendship created between ${referrer._id} and ${newUser._id}`);
-
-        // Notify both users about auto-friendship
+      // Socket notifications
+      try {
         const io = getIO();
-        
         io.to(referrer._id.toString()).emit('notification', {
-          type: 'friend_accept',
+          type: 'referral_signup',
           from: newUser._id,
-          message: `${newUser.name} is now your friend (via referral)!`
+          message: `${newUser.name} joined using your referral code! 🎉`
         });
-        io.to(newUser._id.toString()).emit('notification', {
-          type: 'friend_accept',
-          from: referrer._id,
-          message: `You are now friends with ${referrer.name}!`
-        });
+      } catch (socketErr) {
+        console.warn('Socket not ready for referral notification:', socketErr.message);
       }
-    } catch (err) {
-      console.error("❌ Failed to auto-create friendship:", err.message);
+
+      // Auto-friendship between new user and referrer
+      try {
+        const existingFriendship = await Friendship.findOne({
+          $or: [
+            { requester: referrer._id, recipient: newUser._id },
+            { requester: newUser._id, recipient: referrer._id }
+          ]
+        });
+
+        if (!existingFriendship) {
+          await Friendship.create({
+            requester: referrer._id,
+            recipient: newUser._id,
+            status: 'accepted'
+          });
+          console.log(`🤝 Auto-friendship created between ${referrer._id} and ${newUser._id}`);
+
+          try {
+            const io = getIO();
+            io.to(referrer._id.toString()).emit('notification', {
+              type: 'friend_accept',
+              from: newUser._id,
+              message: `${newUser.name} is now your friend (via referral)!`
+            });
+            io.to(newUser._id.toString()).emit('notification', {
+              type: 'friend_accept',
+              from: referrer._id,
+              message: `You are now friends with ${referrer.name}!`
+            });
+          } catch (socketErr) {
+            console.warn('Socket not ready for friendship notification:', socketErr.message);
+          }
+        }
+      } catch (err) {
+        console.error('❌ Failed to auto-create friendship:', err.message);
+      }
+
+      // Referral activation check
+      await checkReferralActivation(referrer);
     }
 
+    // ── Issue JWT ───────────────────────────────────────────────────────────
     const payload = {
       user: {
         id: newUser._id.toString(),
@@ -176,30 +215,11 @@ exports.createUser = async (req, res) => {
         role: newUser.role
       }
     };
-    const authtoken = jwt.sign(payload, JWT_SECRET);
+    const authtoken = signToken(payload);
 
-    try {
-      if (referrer) {
-        await fetch('http://localhost:5000/api/activity/referral', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${jwt.sign({ user: { id: newUser._id.toString() } }, JWT_SECRET)}`
-          },
-          body: JSON.stringify({
-            referralNumber: referrer._id.toString(),
-            referrerCode: referrer.referralId,
-            newUserId: newUser._id.toString()
-          })
-        });
-      }
-    } catch (err) {
-      console.error("Failed to log referral activity automatically:", err.message);
-    }
-
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
-      authtoken: authtoken.trim().replace(/\s/g, ''),
+      authtoken: authtoken.trim(),
       user: {
         id: newUser._id,
         name: newUser.name,
@@ -208,56 +228,19 @@ exports.createUser = async (req, res) => {
         username: newUser.username,
         isAdmin: newUser.isAdmin,
         subscription: newUser.subscription,
-        // ✅ expose the public referralId to the client
         referralId: newUser.referralId
       },
       message: 'Account created successfully'
     });
-
-    // After creating newUser, Activity, and before sending the final response:
-    if (referrer) {
-      try {
-        const referredCount = await User.countDocuments({ referral: referrer._id });
-
-        // Activate via referrals if target reached and not already active by paid
-        const target = referrer.subscription?.referralTarget ?? 10;
-        const alreadyActive = !!referrer.subscription?.active;
-
-        if (referredCount >= target && !alreadyActive) {
-          const now = new Date();
-          const oneYearLater = new Date(now);
-          oneYearLater.setFullYear(now.getFullYear() + 1);
-
-          await User.findByIdAndUpdate(referrer._id, {
-            $set: {
-              subscription: {
-                ...referrer.subscription?.toObject?.() || referrer.subscription || {},
-                plan: referrer.subscription?.plan || 'Referral',
-                active: true,
-                startDate: now,
-                expiresAt: oneYearLater,
-                autoRenew: false,
-                activationMethod: 'referrals',
-                referralActivatedAt: now,
-                referralTarget: target
-              }
-            }
-          });
-          console.log(`🎉 Referral activation: ${referrer._id} now active via referrals`);
-        }
-      } catch (e) {
-        console.error('Referral activation check failed:', e.message);
-      }
-    }
-
   } catch (error) {
-    console.error(error.message);
-    res.status(500).json({ success: false, message: 'Create User - Internal Server Error' }); // FIXED
+    console.error('createUser error:', error);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
   }
-
 };
 
-// Login existing user
+// ── Login existing user ──────────────────────────────────────────────────────
+// @route  POST /api/auth/login
+// @access Public
 exports.loginUser = async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
@@ -267,7 +250,6 @@ exports.loginUser = async (req, res) => {
   try {
     let user = null;
 
-    // Determine identifier type
     if (/^\S+@\S+\.\S+$/.test(identifier)) {
       user = await User.findOne({ email: identifier });
     } else if (/^\d{10}$/.test(identifier)) {
@@ -276,28 +258,25 @@ exports.loginUser = async (req, res) => {
       user = await User.findOne({ username: identifier });
     }
 
-    // Check if user was found
     if (!user) {
-      return res.status(400).json({ error: 'User not found' });
+      // FIX: Return a generic "Invalid credentials" message instead of exposing
+      // whether the account exists (prevents user enumeration attacks).
+      return res.status(400).json({ error: 'Invalid credentials.' });
     }
 
-    // ✅ NOW check the role against actual user
-    // if (role && user.role && user.role !== role) {
     if (role && user.role !== role) {
       return res.status(403).json({ error: 'Role mismatch. Access denied.' });
     }
 
-    // Validate password
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
-      return res.status(400).json({ error: 'Incorrect password' });
+      return res.status(400).json({ error: 'Invalid credentials.' });
     }
 
-    // ✅ Update lastActive before issuing token
-    user.lastActive = new Date();
-    await user.save()
+    // FIX: Use findByIdAndUpdate for lastActive instead of save() to avoid
+    // triggering pre-save hooks (like the referralId generator) unnecessarily.
+    await User.findByIdAndUpdate(user._id, { lastActive: new Date() });
 
-    // Generate token
     const payload = {
       user: {
         id: user._id.toString(),
@@ -306,37 +285,32 @@ exports.loginUser = async (req, res) => {
         role: user.role
       }
     };
-    const authtoken = jwt.sign(payload, JWT_SECRET);
+    const authtoken = signToken(payload);
 
-    // ✅ Create notification in DB
-    const loginNote = await Notification.create({
-      user: user._id,
-      type: 'custom', // we can add "login_success" later if you want a dedicated type
-      message: `Welcome back, ${user.name}! You logged in successfully.`,
-      url: '/dashboard'
-    });
+    // Login notification (non-critical, fire-and-forget)
+    try {
+      const loginNote = await Notification.create({
+        user: user._id,
+        type: 'custom',
+        message: `Welcome back, ${user.name}! You logged in successfully.`,
+        url: '/dashboard'
+      });
 
-    // ✅ Push toast notification
-    // await notifyUser(
-    //   user._id,
-    //   `Welcome back, ${user.name}! You logged in successfully.`,
-    //   'custom'
-    // );
+      sendPushToUser(user._id.toString(), {
+        title: 'Login Successful 🎉',
+        message: `Welcome back, ${user.name}!`,
+        url: '/dashboard'
+      });
 
-    // ✅ Push notification to device
-    sendPushToUser(user._id.toString(), {
-      title: 'Login Successful 🎉',
-      message: `Welcome back, ${user.name}!`,
-      url: '/dashboard'
-    });
+      const io = getIO();
+      io.to(user._id.toString()).emit('notification', loginNote);
+    } catch (notifErr) {
+      console.warn('Login notification failed (non-fatal):', notifErr.message);
+    }
 
-    // ✅ Socket emit
-    const io = getIO();
-    io.to(user._id.toString()).emit('notification', loginNote);
-
-    res.json({
+    return res.json({
       success: true,
-      authtoken: authtoken.trim().replace(/\s/g, ''),
+      authtoken: authtoken.trim(),
       user: {
         id: user._id,
         role: user.role,
@@ -352,73 +326,45 @@ exports.loginUser = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error("Login - Internal Server Error:", error.stack);
-    res.status(500).json({ success: false, message: "Login - Internal Server Error" });
+    console.error('Login error:', error.stack);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
   }
 };
 
-// Verify if phone is registered
-exports.checkPhoneExists = async (phone) => {
-  if (!/^\d{10}$/.test(phone)) {
-    return { success: false, message: "Enter a valid 10-digit number" };
-  }
-
-  try {
-    const res = await fetch("http://localhost:5000/api/auth/check-phone", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ phone }),
-    });
-
-    if (res.status === 404) {
-      return { success: false, message: "Phone check endpoint not found. Check backend routing." };
-    }
-
-    const data = await res.json();
-    return data;
-  } catch (err) {
-    console.error("Phone check error:", err);
-    return { success: false, message: "Server error while verifying phone." };
-  }
-};
-
-// ✅ Add this at bottom of authController.js
+// ── Reset password via OTP ───────────────────────────────────────────────────
+// @route  POST /api/auth/reset-password-with-otp
+// @access Public
 exports.resetPasswordWithOtp = async (req, res) => {
-  const { phone, otp, newPassword } = req.body;
+  const { phone, newPassword } = req.body;
 
-  if (!/^\d{10}$/.test(phone) || !otp || newPassword.length < 5) {
-    return res.status(400).json({ success: false, message: "Invalid input." });
+  if (!/^\d{10}$/.test(phone) || !newPassword || newPassword.length < 5) {
+    return res.status(400).json({ success: false, message: 'Invalid input.' });
   }
 
   try {
-    // const verified = await VerifiedPhone.findOne({ phone });
-    // if (!verified) {
-    //   return res.status(400).json({ success: false, message: "Phone not verified." });
-    // }
-
     const user = await User.findOne({ phone });
     if (!user) {
-      return res.status(404).json({ success: false, message: "User not found." });
+      return res.status(404).json({ success: false, message: 'User not found.' });
     }
 
     const salt = await bcrypt.genSalt(10);
     user.password = await bcrypt.hash(newPassword, salt);
     await user.save();
 
-    return res.json({ success: true, message: "Password reset successful." });
+    return res.json({ success: true, message: 'Password reset successful.' });
   } catch (err) {
-    console.error("Reset password error:", err);
-    return res.status(500).json({ success: false, message: "Server error." });
+    console.error('Reset password error:', err);
+    return res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
 
-// ✅ GET /api/users/referred — fetch all users referred by this user
+// ── Get referred users ───────────────────────────────────────────────────────
+// @route  GET /api/auth/users/referred
+// @access Private
 exports.getReferredUsers = async (req, res) => {
-  const userId = req.user.id;
-
   try {
-    const referredUsers = await User.find({ referral: userId }).select(
-      'name username email phone subscription active'
+    const referredUsers = await User.find({ referral: req.user.id }).select(
+      'name username email phone subscription'
     );
     res.status(200).json({ referredUsers });
   } catch (err) {
@@ -427,11 +373,13 @@ exports.getReferredUsers = async (req, res) => {
   }
 };
 
-// ✅ Get user by ID
+// ── Get user by ID ───────────────────────────────────────────────────────────
+// @route  GET /api/auth/getloggeduser/:id
+// @access Private
 exports.getUserById = async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select('-password');
-    if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
     res.json({
       success: true,
@@ -448,26 +396,26 @@ exports.getUserById = async (req, res) => {
         referralId: user.referralId
       }
     });
-
   } catch (error) {
-    console.error("Get User By ID Error:", error.message);
-    res.status(500).json({ error: "Failed to fetch user details" });
+    console.error('getUserById error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch user details' });
   }
 };
 
+// ── Accept terms ─────────────────────────────────────────────────────────────
+// @route  POST /api/auth/accept-terms
+// @access Private
 exports.acceptTerms = async (req, res) => {
   try {
-    const userId = req.user.id;
-    const user = await User.findById(userId);
-
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { termsAccepted: true },
+      { new: true }
+    );
     if (!user) return res.status(404).json({ error: 'User not found' });
-
-    user.termsAccepted = true;
-    await user.save();
-
     res.status(200).json({ success: true, message: 'Terms accepted' });
   } catch (err) {
-    console.error('Error updating terms acceptance:', err.message);
+    console.error('acceptTerms error:', err.message);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };

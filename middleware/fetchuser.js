@@ -1,63 +1,81 @@
 require('dotenv').config();
-var jwt = require('jsonwebtoken');
+const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 
-const JWT_SECRET = process.env.JWT_SECRET
-// const JWT_SECRET = process.env.JWT_SECRET || "$hreeisa$$Busine$$mindedBoy2428";
-// const JWT_SECRET = "$hreeisa$$Busine$$mindedBoy2428";
+const JWT_SECRET = process.env.JWT_SECRET;
 
-const fetchUser = async (req, res, next) => {
-    // console.log("🛂 Incoming request - checking auth token"); //temporary
-    // Get token from header
-    const authHeader = req.header('Authorization') || req.header('authorization');
-    if (!authHeader) {
-        return res.status(401).send({ error: "Access denied: Please authenticate using valid token!" });
-    }
-    // const token = req.header('auth-token');
-
-    const token = authHeader.startsWith('Bearer ')
-        ? authHeader.slice(7)
-        : authHeader;
-
-    // console.log("🛡️ Extracted Token:", token);
-
-    if (!token || token === 'null' || token === 'undefined') {
-        console.warn("No usable token found:", token);
-        return res.status(401).send({ error: "Access denied: Token missing or invalid!" });
-    }
-
-    if (!token || token.split('.').length !== 3) {
-        console.warn("❌ Malformed token received:", JSON.stringify(token));
-        return next(new Error("Malformed JWT token"));
-    }
-
-    try {
-
-        const data = jwt.verify(token, JWT_SECRET);
-        // console.log("🔓 JWT verified:", data); //temporary
-
-        const user = await User.findById(data.user.id).select('name email role'); // Add fields as needed
-
-        if (!user) {
-            return res.status(401).send({ error: "Access denied: User not found!" });
-        }
-
-        req.user = {
-            id: user._id.toString(),
-            name: user.name,
-            email: user.email,
-            isAdmin: user.role === 'admin'
-        };
-
-        // ⏱️ Update lastActive on every API call
-        await User.findByIdAndUpdate(data.user.id, { lastActive: Date.now() });
-
-        next();
-
-    } catch (error) {
-        console.error("❌ JWT validation failed:", error.message)
-        res.status(401).send({ error: "Access denied: Invalid token!" });
-    }
+// FIX: Fail loudly at startup if the secret is missing rather than silently
+// falling back to an insecure hardcoded value.
+if (!JWT_SECRET) {
+  throw new Error('FATAL: JWT_SECRET environment variable is not set.');
 }
 
-module.exports = fetchUser
+const fetchUser = async (req, res, next) => {
+  const authHeader = req.header('Authorization') || req.header('authorization');
+
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Access denied: No authorization header provided.' });
+  }
+
+  // Support both "Bearer <token>" and raw token formats
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : authHeader.trim();
+
+  if (!token || token === 'null' || token === 'undefined') {
+    console.warn('fetchUser: missing or placeholder token');
+    return res.status(401).json({ error: 'Access denied: Token missing or invalid.' });
+  }
+
+  // FIX: Moved the malformed-token check BEFORE the try/catch so it returns
+  // a proper 401 JSON response instead of calling next(new Error(...)) which
+  // would hit Express's default error handler and potentially leak stack traces.
+  if (token.split('.').length !== 3) {
+    console.warn('fetchUser: malformed JWT received:', JSON.stringify(token));
+    return res.status(401).json({ error: 'Access denied: Malformed token.' });
+  }
+
+  try {
+    const data = jwt.verify(token, JWT_SECRET);
+
+    // FIX: Validate the token payload contains the expected structure before
+    // doing a DB lookup to avoid a crash on tokens with unexpected shapes.
+    if (!data?.user?.id) {
+      return res.status(401).json({ error: 'Access denied: Invalid token payload.' });
+    }
+
+    const user = await User.findById(data.user.id).select('name email role banned');
+
+    if (!user) {
+      return res.status(401).json({ error: 'Access denied: User not found.' });
+    }
+
+    // FIX: Reject requests from banned users at the middleware level so no
+    // other route handler needs to remember to check this.
+    if (user.banned) {
+      return res.status(403).json({ error: 'Account restricted.' });
+    }
+
+    req.user = {
+      id: user._id.toString(),
+      name: user.name,
+      email: user.email,
+      isAdmin: user.role === 'admin'
+    };
+
+    // Update lastActive (fire-and-forget — do not block the request)
+    User.findByIdAndUpdate(data.user.id, { lastActive: Date.now() }).catch(err =>
+      console.error('fetchUser: failed to update lastActive:', err.message)
+    );
+
+    next();
+  } catch (error) {
+    // Distinguish expired tokens from other verification errors for better
+    // client-side handling (e.g. auto-refresh vs hard logout).
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Access denied: Token has expired.' });
+    }
+    console.error('fetchUser: JWT validation failed:', error.message);
+    return res.status(401).json({ error: 'Access denied: Invalid token.' });
+  }
+};
+
+module.exports = fetchUser;
