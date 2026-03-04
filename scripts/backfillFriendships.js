@@ -1,22 +1,24 @@
 // backfillFriendships.js
 require('dotenv').config({ path: '../.env' });
+
 const mongoose = require('mongoose');
-const User = require('../models/User');
+const User = require('../models/User');        // model name internally: 'user'
 const Friendship = require('../models/Friendship');
 
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/sosholife';
 
 (async () => {
   try {
-    await mongoose.connect(MONGO_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
+    await mongoose.connect(MONGO_URI);
     console.log("✅ Connected to MongoDB");
 
-    // Find all users that were referred by someone
+    // Find users who were referred by someone
     const referredUsers = await User.find({ referral: { $ne: null } })
-      .populate('referral', 'name');
+      .populate({
+        path: 'referral',
+        select: 'name',
+        model: 'user'   // match schema model name
+      });
 
     console.log(`🔍 Found ${referredUsers.length} referred users`);
 
@@ -41,10 +43,13 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/sosholife'
           status: 'accepted'
         });
 
-        console.log(`[notification] ${referrer.name} and ${user.name} are now friends (backfill).`);
+        console.log(
+          `[notification] ${referrer.name} and ${user.name} are now friends (backfill).`
+        );
+
         createdCount++;
       }
-    };
+    }
 
     console.log(`🎉 Backfill complete. Friendships created: ${createdCount}`);
     process.exit(0);

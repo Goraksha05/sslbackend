@@ -1,4 +1,4 @@
-require('dotenv').config();
+require("dotenv").config({ override: true });
 
 // ⚠️ Jobs are started AFTER the DB connects (see mongoose.connect().then below).
 // Removed pre-emptive require() here to avoid scheduling DB queries before
@@ -42,8 +42,10 @@ const ALLOWED_ORIGINS = (process.env.FRONTEND_BASE_URL || '')
   .map(o => o.trim())
   .filter(Boolean)
   .concat([
+    'http://localhost:3001',
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'http://127.0.0.1:3001',
     'https://sosholife.com',
     'https://www.sosholife.com'
   ]);

@@ -2,8 +2,8 @@
 const fs = require("fs");
 const path = require("path");
 const mongoose = require("mongoose");
-const Message = require("../schema_models/Message");
-const Post = require("../schema_models/PostSchema");
+const Message = require("../models/Message");
+const Post = require("../models/Posts");
 
 const UPLOADS_DIR = path.join(__dirname, "..", "uploads");
 

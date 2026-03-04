@@ -7,10 +7,7 @@ const fsPromises = fs.promises;
 const PostSchema = require('../models/Posts');
 var fetchUser = require('../middleware/fetchuser');
 const { body, validationResult } = require('express-validator');
-//const { uploadMultiple } = require('../middleware/upload');
 const {
-    uploadPostMedia,
-    //  uploadMultiple,
     createUploadMiddleware,
     generatePublicUrl,
 } = require("../middleware/upload");
@@ -20,14 +17,13 @@ const calculatePostsReward = require('../utils/calculatePostsReward');
 const Profile = require('../models/Profile');
 const Comment = require('../models/Comment');
 const compressFile = require("../utils/compressFile");
-const generateThumbnail = require("../utils/generateThumbnail");
 const Notification = require('../models/Notification');
 const { getIO } = require('../sockets/IOsocket');
 const { sendPushToUser } = require('../utils/pushService');
 const notifyUser = require('../utils/notifyUser');
-//const requireVerified = require('../middleware/requireVerified');
 const moderateMedia = require('../utils/moderateMedia');
 const sanitizeHtml = require('sanitize-html');
+
 const getBaseUrl = (req) => {
     return process.env.NODE_ENV === "production"
         ? "https://api.sosholife.com"
@@ -40,13 +36,12 @@ router.get('/fetchallposts', fetchUser, async (req, res) => {
         const posts = await PostSchema.find({
             $or: [
                 { visibility: 'public' },
-                { user_id: req.user.id } // include own posts even if private
+                { user_id: req.user.id }
             ]
         })
             .populate('user_id', 'name subscription')
-            .sort({ date: -1 }); // Add this line to fetch user's name
+            .sort({ date: -1 });
 
-        // Fetch all profiles once
         const userIds = posts.map(p => p.user_id._id);
         const profiles = await Profile.find({ user_id: { $in: userIds } });
         const profileMap = {};
@@ -67,137 +62,202 @@ router.get('/fetchallposts', fetchUser, async (req, res) => {
     }
 });
 
-//Route 2: Add Posts using: POST "/api/posts/addnweposts". Login required
-//router.post('/addnewposts', fetchUser, uploadMultiple('media', 5), [
+//Route 2: Add Posts using: POST "/api/posts/addnewposts". Login required
 router.post(
     "/addnewposts",
     fetchUser,
-//    requireVerified,
     createUploadMiddleware("postmedia").array("media", 5),
     [
-        //    body('post').isLength({ min: 1 }).withMessage('Post must be at least 1 characters long'),
         body('visibility').optional().isIn(['public', 'private', 'friends']).withMessage('Invalid visibility type'),
-        // body('media').custom((value, { req }) => {
-        //     if (!req.files || req.files.length === 0) return true; // No media is okay
-        //     if (!Array.isArray(req.files)) return true; // multer handles array
-        //     return true;
-        // }).withMessage('Invalid media format')
-
-    ], async (req, res) => {
-        const { post, media, visibility } = req.body;
-
+    ],
+    async (req, res) => {
         try {
             const errors = validationResult(req);
             if (!errors.isEmpty()) {
-                // console.log("Validation failed:", errors.array());
                 return res.status(400).json({ errors: errors.array() });
             }
 
-            // const mediaArray = req.files.map(file => ({
-
-            //     url: generatePublicUrl(file.path),
-
-            //     //            url: `/uploads/profiles/${req.user.id}/${file.filename}`,
-            //     type: file.mimetype.startsWith('image') ? 'image' : file.mimetype.startsWith('video') ? 'video' : 'file',
-            // }));
-
-            const localPaths = (req.files || []).map(f => f.path); // paths before generatePublicUrl
-            const mod = await moderateMedia(localPaths); // <-- scan
-            if (mod.isNSFW) {
-                // Option A: hard reject (auto-clear)
-                return res.status(415).json({ message: "NSFW content is not allowed." });
-                // Option B: quarantine
-                // newpost.moderation = { status:'rejected', labels:mod.labels, score:mod.score };
-            }
-
-            // 🔽 Compress every uploaded file and capture (possibly changed) paths
-            const processedMedia = [];
-            for (const file of req.files || []) {
-                const { filePath, mimetype, thumbnails } = await compressFile(file.path, file.mimetype);
-
-
-                processedMedia.push({
-                    url: generatePublicUrl(filePath),
-                    type: mimetype.startsWith("image") ? "image" : 
-                    mimetype.startsWith("video") ? "video" : "file",
-                    mimeType: mimetype,
-                    thumbnail: thumbnails[0] ? generatePublicUrl(thumbnails[0]) : null,
-                });
-            }
-
+            const files = req.files || [];
             const cleanPost = sanitizeHtml(req.body.post || " ");
+            const baseUrl = getBaseUrl(req);
 
+            // Build initial media array from raw uploaded files (fast — no processing yet)
+            // FIX: generatePublicUrl(req, subDir, userId, filename) — pass all 4 args correctly.
+            const initialMedia = files.map(file => {
+                const subDir = 'postmedia';
+                const userId = req.user.id;
+                const url = generatePublicUrl(req, subDir, userId, file.filename);
+                return {
+                    url,
+                    type: file.mimetype.startsWith('image') ? 'image'
+                        : file.mimetype.startsWith('video') ? 'video' : 'file',
+                    mimeType: file.mimetype,
+                    thumbnail: null,
+                };
+            });
+
+            // Save post immediately with uncompressed URLs — client gets a fast response.
             const newpost = new PostSchema({
                 user_id: req.user.id,
                 post: cleanPost,
                 visibility: req.body.visibility || 'public',
-                // media: mediaArray,
-                media: processedMedia,
-                moderation: { status: 'approved', labels: mod.labels, score: mod.score }
+                media: initialMedia,
+                moderation: { status: 'queued', labels: [], score: 0 }
             });
 
             const savePost = await newpost.save();
 
-            // ---- Auto reward with slab tracking ----
-            const user = await User.findById(req.user.id);
-            const postCount = await PostSchema.countDocuments({ user_id: req.user.id });
-
-            // Define slabs same as in calculatePostsReward
-            const slabs = [30, 70, 150, 300, 600, 1000];
-            const reachedSlab = slabs.find(slab => postCount === slab);
-
-            let reward = null;
-
-            if (reachedSlab && !user.rewardedPostMilestones.includes(reachedSlab)) {
-                reward = calculatePostsReward(postCount);
-
-                user.totalGroceryCoupons = (user.totalGroceryCoupons || 0) + reward.groceryCoupons;
-                user.totalShares = (user.totalShares || 0) + reward.shares;
-                user.rewardedPostMilestones.push(reachedSlab);
-                await user.save();
-
-                const activity = new Activity({ userpost: req.user.id });
-                await activity.save();
-            }
-
-            // Push Notification
-            if (reward) {
-                // ✅ DB Notification
-                await Notification.create({
-                    user: req.user.id,
-                    sender: req.user.id,
-                    type: 'post_reward',
-                    message: `🎉 Congrats! You reached ${reachedSlab} posts and earned a reward.`,
-                    url: '/rewards/posts'
-                });
-
-                // ✅ Toast
-                await notifyUser(req.user.id, `🎉 Congrats! You reached ${reachedSlab} posts.`, 'post_reward');
-
-                // ✅ Push
-                sendPushToUser(req.user.id.toString(), {
-                    title: 'Milestone Reached!',
-                    message: `You’ve published ${reachedSlab} posts. Reward granted 🎁`,
-                    url: '/rewards/posts'
-                });
-
-                // ✅ Socket
-                const io = getIO();
-                io.to(req.user.id.toString()).emit('notification', {
-                    type: 'post_reward',
-                    message: `🎉 You reached ${reachedSlab} posts and earned a reward!`
-                });
-            }
-
+            // Respond immediately so the client doesn't time out.
             res.json({
                 message: 'Post created',
                 post: savePost,
-                ...(reward && { reward, note: `Slab ${reachedSlab} reached, reward granted` })
             });
+
+            // ── Background: compress + moderate (non-blocking, after response sent) ──
+            if (files.length > 0) {
+                setImmediate(async () => {
+                    try {
+                        // Compression
+                        const processedMedia = [];
+                        for (const file of files) {
+                            try {
+                                const { filePath, mimetype, thumbnails } = await compressFile(file.path, file.mimetype);
+                                const subDir = 'postmedia';
+                                const userId = req.user.id;
+                                const filename = path.basename(filePath);
+                                const url = generatePublicUrl(req, subDir, userId, filename);
+                                const thumbUrl = thumbnails[0]
+                                    ? generatePublicUrl(req, subDir, userId, path.basename(thumbnails[0]))
+                                    : null;
+                                processedMedia.push({
+                                    url,
+                                    type: mimetype.startsWith('image') ? 'image'
+                                        : mimetype.startsWith('video') ? 'video' : 'file',
+                                    mimeType: mimetype,
+                                    thumbnail: thumbUrl,
+                                });
+                            } catch (compressErr) {
+                                console.error('Compression failed for file, keeping original:', compressErr.message);
+                                // Keep the original entry on error
+                                const subDir = 'postmedia';
+                                processedMedia.push({
+                                    url: generatePublicUrl(req, subDir, req.user.id, file.filename),
+                                    type: file.mimetype.startsWith('image') ? 'image'
+                                        : file.mimetype.startsWith('video') ? 'video' : 'file',
+                                    mimeType: file.mimetype,
+                                    thumbnail: null,
+                                });
+                            }
+                        }
+
+                        // Moderation — only scan images (Rekognition doesn't handle video directly)
+                        const imagePaths = files
+                            .filter(f => f.mimetype.startsWith('image/'))
+                            .map(f => f.path)
+                            .filter(p => fs.existsSync(p));
+
+                        let moderationResult = { isNSFW: false, labels: [], score: 0 };
+                        if (imagePaths.length > 0) {
+                            try {
+                                moderationResult = await moderateMedia(imagePaths);
+                            } catch (modErr) {
+                                console.error('Moderation scan failed (non-fatal):', modErr.message);
+                            }
+                        }
+
+                        const moderationStatus = moderationResult.isNSFW ? 'rejected' : 'approved';
+
+                        // Update post with compressed media + moderation result
+                        await PostSchema.findByIdAndUpdate(savePost._id, {
+                            media: processedMedia,
+                            moderation: {
+                                status: moderationStatus,
+                                labels: moderationResult.labels,
+                                score: moderationResult.score,
+                            }
+                        });
+
+                        if (moderationResult.isNSFW) {
+                            console.warn(`Post ${savePost._id} flagged as NSFW and rejected.`);
+                            return; // Skip rewards for rejected posts
+                        }
+                    } catch (bgErr) {
+                        console.error('Background post processing error:', bgErr.message);
+                    }
+
+                    // ── Reward milestone check ──
+                    try {
+                        const user = await User.findById(req.user.id);
+                        const postCount = await PostSchema.countDocuments({ user_id: req.user.id });
+                        const slabs = [30, 70, 150, 300, 600, 1000];
+                        const reachedSlab = slabs.find(slab => postCount === slab);
+
+                        if (reachedSlab && !user.rewardedPostMilestones.includes(reachedSlab)) {
+                            const reward = calculatePostsReward(postCount);
+                            user.totalGroceryCoupons = (user.totalGroceryCoupons || 0) + reward.groceryCoupons;
+                            user.totalShares = (user.totalShares || 0) + reward.shares;
+                            user.rewardedPostMilestones.push(reachedSlab);
+                            await user.save();
+
+                            const activity = new Activity({ userpost: req.user.id });
+                            await activity.save();
+
+                            await Notification.create({
+                                user: req.user.id,
+                                sender: req.user.id,
+                                type: 'post_reward',
+                                message: `🎉 Congrats! You reached ${reachedSlab} posts and earned a reward.`,
+                                url: '/rewards/posts'
+                            });
+
+                            await notifyUser(req.user.id, `🎉 Congrats! You reached ${reachedSlab} posts.`, 'post_reward');
+
+                            sendPushToUser(req.user.id.toString(), {
+                                title: 'Milestone Reached!',
+                                message: `You've published ${reachedSlab} posts. Reward granted 🎁`,
+                                url: '/rewards/posts'
+                            });
+
+                            const io = getIO();
+                            io.to(req.user.id.toString()).emit('notification', {
+                                type: 'post_reward',
+                                message: `🎉 You reached ${reachedSlab} posts and earned a reward!`
+                            });
+                        }
+                    } catch (rewardErr) {
+                        console.error('Reward processing error:', rewardErr.message);
+                    }
+                });
+            } else {
+                // Text-only post: run reward check inline (fast, no file I/O)
+                try {
+                    const user = await User.findById(req.user.id);
+                    const postCount = await PostSchema.countDocuments({ user_id: req.user.id });
+                    const slabs = [30, 70, 150, 300, 600, 1000];
+                    const reachedSlab = slabs.find(slab => postCount === slab);
+
+                    if (reachedSlab && !user.rewardedPostMilestones.includes(reachedSlab)) {
+                        const reward = calculatePostsReward(postCount);
+                        user.totalGroceryCoupons = (user.totalGroceryCoupons || 0) + reward.groceryCoupons;
+                        user.totalShares = (user.totalShares || 0) + reward.shares;
+                        user.rewardedPostMilestones.push(reachedSlab);
+                        await user.save();
+                    }
+                } catch (rewardErr) {
+                    console.error('Text post reward error:', rewardErr.message);
+                }
+
+                await PostSchema.findByIdAndUpdate(savePost._id, {
+                    'moderation.status': 'approved'
+                });
+            }
 
         } catch (error) {
             console.error(error.message);
-            res.status(500).send("Internal Server Error");
+            // Only send error response if headers not already sent
+            if (!res.headersSent) {
+                res.status(500).send("Internal Server Error");
+            }
         }
     });
 
@@ -207,17 +267,15 @@ router.put('/updateposts/:id', fetchUser, async (req, res) => {
     const { post, media, visibility } = req.body;
 
     try {
-        //create a newPost Object
         let newPost = {};
         if (post) { newPost.post = post; }
         if (media) { newPost.media = media; }
         if (visibility) { newPost.visibility = visibility; }
 
-        //Find the post to be updated and update it
-        let userPost = await PostSchema.findById(req.params.id);  //here req.params.id means post id
+        let userPost = await PostSchema.findById(req.params.id);
         if (!userPost) { return res.status(404).send("Not Found") }
 
-        if (!userPost.user_id) {                                    //here user_id means that id which is in PostSchema
+        if (!userPost.user_id) {
             return res.status(400).send("Post has no associated user");
         }
 
@@ -227,22 +285,19 @@ router.put('/updateposts/:id', fetchUser, async (req, res) => {
             req.params.id,
             { $set: newPost },
             { new: true }
-
         );
         res.json({ updatedPost });
-
 
     } catch (error) {
         console.error(error.message);
         res.status(500).send("Internal Server Error");
     }
-
 });
 
 //Route 4: Delete Posts using: DELETE "/api/posts/deleteposts". Login required
 router.delete('/deleteposts/:id', fetchUser, async (req, res) => {
     try {
-        const userPost = await PostSchema.findById(req.params.id); // req.params.id = post id
+        const userPost = await PostSchema.findById(req.params.id);
 
         if (!userPost) {
             return res.status(404).send("Post not found");
@@ -252,18 +307,14 @@ router.delete('/deleteposts/:id', fetchUser, async (req, res) => {
             return res.status(400).send("Post has no associated user");
         }
 
-        // ✅ Check if logged-in user is the owner
         if (userPost.user_id.toString() !== req.user.id) {
             return res.status(401).send("Not allowed");
         }
 
-        // ✅ Delete associated media files if present
         if (userPost.media && userPost.media.length > 0) {
             for (const media of userPost.media) {
                 if (!media.url) continue;
-
                 try {
-                    // Extract filename from stored URL
                     const mediaFileName = path.basename(media.url);
                     const mediaPath = path.join(
                         __dirname,
@@ -273,10 +324,8 @@ router.delete('/deleteposts/:id', fetchUser, async (req, res) => {
                         userPost.user_id.toString(),
                         mediaFileName
                     );
-
                     if (fs.existsSync(mediaPath)) {
                         await fsPromises.unlink(mediaPath);
-                        // console.log("✅ Deleted media file:", mediaPath);
                     } else {
                         console.warn("⚠️ Media file not found:", mediaPath);
                     }
@@ -286,7 +335,6 @@ router.delete('/deleteposts/:id', fetchUser, async (req, res) => {
             }
         }
 
-        // ✅ Delete post from DB
         const deletedPost = await PostSchema.findByIdAndDelete(req.params.id);
 
         return res.json({
@@ -325,7 +373,6 @@ router.get('/:postId/comments', fetchUser, async (req, res) => {
 router.post('/:postId/comments', fetchUser, async (req, res) => {
     const { postId } = req.params;
     const { content } = req.body;
-    console.log('Incoming comment content:', content);
 
     if (!content || content.trim() === '') {
         return res.status(400).json({ message: 'Comment cannot be empty' });
@@ -341,12 +388,10 @@ router.post('/:postId/comments', fetchUser, async (req, res) => {
         const saved = await newComment.save();
         await saved.populate('userId', 'name');
 
-        // Emit real-time comment
         const { getIO } = require('../sockets/IOsocket');
         const io = getIO();
         io.to(postId).emit('comment:new', saved);
 
-        // ✅ Notify post owner about new comment
         const post = await PostSchema.findById(postId).populate('user_id', 'name');
         if (post && post.user_id._id.toString() !== req.user.id) {
             await Notification.create({
@@ -365,8 +410,8 @@ router.post('/:postId/comments', fetchUser, async (req, res) => {
                 url: `/posts/${postId}`
             });
 
-            const io = getIO();
-            io.to(post.user_id._id.toString()).emit('notification', {
+            const io2 = getIO();
+            io2.to(post.user_id._id.toString()).emit('notification', {
                 type: 'comment',
                 from: req.user.id,
                 message: `${saved.userId.name} commented on your post 💬`
@@ -380,7 +425,6 @@ router.post('/:postId/comments', fetchUser, async (req, res) => {
     }
 });
 
-// routes/comments.js
 router.get('/:postId/comments/count', async (req, res) => {
     const { postId } = req.params;
     try {
@@ -402,15 +446,14 @@ router.put('/like/:id', fetchUser, async (req, res) => {
         const index = post.likes.indexOf(userId);
 
         if (index === -1) {
-            post.likes.push(userId); // Like
+            post.likes.push(userId);
         } else {
-            post.likes.splice(index, 1); // Unlike
+            post.likes.splice(index, 1);
         }
 
         await post.save();
 
         if (index === -1 && post.user_id.toString() !== req.user.id) {
-            // ✅ Notify post owner on like
             await Notification.create({
                 user: post.user_id,
                 sender: req.user.id,
@@ -443,4 +486,4 @@ router.put('/like/:id', fetchUser, async (req, res) => {
 });
 
 
-module.exports = router
+module.exports = router;

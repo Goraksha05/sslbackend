@@ -1,4 +1,4 @@
-require('dotenv').config();
+require("dotenv").config({ override: true });
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 
