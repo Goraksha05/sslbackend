@@ -136,6 +136,7 @@ app.use('/api/admin', adminRouter);
 app.use('/api/upload', require('./routes/upload'));
 app.use('/api/chat', require('./routes/chat'));
 app.use('/api/message', require('./routes/message'));
+app.use('/api/status',  require('./routes/status'));
 
 app.use('/api', require('./routes/search'));
 app.use('/api/push', require('./routes/push'));

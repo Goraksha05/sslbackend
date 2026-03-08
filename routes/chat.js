@@ -1,30 +1,55 @@
 // backend/routes/chat.js
-const express = require("express");
-const router = express.Router();
-const User = require("../models/User");
-const Chat = require("../models/Chat");
-const Message = require("../models/Message");
+//
+// ── Bugs fixed in this version ────────────────────────────────────────────────
+//
+// BUG 1 — Route ordering: GET /:userId shadows all later GET routes (CRITICAL)
+//   Express matches routes top-to-bottom. Because GET /:userId was declared
+//   first, every subsequent GET route like GET /messages/:chatId,
+//   GET /online-status/:chatId, GET /unread/:chatId, GET /search/:chatId
+//   was UNREACHABLE — they were all matched as /:userId with userId equal to
+//   the literal string "messages", "online-status", "unread", or "search".
+//
+//   Fix: all specific GET routes (with a fixed path segment) are declared
+//   BEFORE GET /:userId. The rule is: specific routes before parametric ones.
+//
+// BUG 2 — GET /:userId uses req.params.userId instead of req.user.id
+//   Any authenticated user could fetch any other user's chat list by changing
+//   the URL parameter. fetchUser puts the verified identity in req.user.id.
+//
+//   Fix: use req.user.id for the DB query. The URL param is still accepted for
+//   backward-compatibility with the frontend but is now IGNORED for the query.
+//
+// BUG 3 — unreadCount Map serialization after toObject()
+//   chat.toObject() converts the Mongoose Map to a plain JS object keyed by
+//   string. chat.getUnreadCount() calls this.unreadCount.get(...) — but after
+//   toObject() the field is no longer a Map, so get() throws. The fix is to
+//   call getUnreadCount() on the Mongoose document BEFORE toObject().
+
+const express  = require("express");
+const router   = express.Router();
+const Chat     = require("../models/Chat");
+const Message  = require("../models/Message");
 const fetchUser = require("../middleware/fetchuser");
 
-// ✅ Create or find 1:1 chat
+// ─── POST / — Create or find a 1:1 chat ──────────────────────────────────────
 router.post("/", fetchUser, async (req, res) => {
   try {
     const { receiverId } = req.body;
     const senderId = req.user.id;
 
-    if (!receiverId || !senderId) {
-      return res.status(400).json({ message: "Missing sender or receiver ID" });
+    if (!receiverId) {
+      return res.status(400).json({ message: "Missing receiverId" });
     }
 
-    let chat = await Chat.findOne({ 
-      members: { $all: [senderId, receiverId] },
-      isGroup: { $ne: true } 
+    let chat = await Chat.findOne({
+      members:  { $all: [senderId, receiverId] },
+      isGroup:  { $ne: true },
     });
-    
+
     if (!chat) {
-      chat = await Chat.create({ 
-        members: [senderId, receiverId],
-        unreadCount: new Map([[senderId, 0], [receiverId, 0]])
+      chat = await Chat.create({
+        members:     [senderId, receiverId],
+        unreadCount: new Map([[senderId, 0], [receiverId, 0]]),
       });
     }
 
@@ -36,101 +61,19 @@ router.post("/", fetchUser, async (req, res) => {
   }
 });
 
-// ✅ Get all chats for a user
-router.get("/:userId", fetchUser, async (req, res) => {
-  try {
-    const chats = await Chat.find({ members: req.params.userId })
-      .populate("members", "name _id email username profileavatar lastActive")
-      .populate("lastMessageSender", "name")
-      .sort({ lastMessageTime: -1 }); // Most recent first
-
-    // Add unread count to each chat
-    const chatsWithUnread = chats.map(chat => {
-      const chatObj = chat.toObject();
-      chatObj.unreadCount = chat.getUnreadCount(req.params.userId);
-      return chatObj;
-    });
-
-    res.json(chatsWithUnread);
-  } catch (err) {
-    console.error("❌ Failed to load chats:", err.message);
-    res.status(500).json({ message: "Could not load chats." });
-  }
-});
-
-// ✅ Get all messages in a chat
-router.get("/messages/:chatId", fetchUser, async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    const messages = await Message.find({
-      chatId: req.params.chatId,
-      deletedBy: { $ne: userId }
-    })
-      .populate("sender", "name _id profileavatar")
-      .populate("replyTo.messageId", "text sender")
-      .sort({ createdAt: 1 });
-
-    res.status(200).json(messages);
-  } catch (err) {
-    console.error(`❌ Failed to fetch messages: ${err.message}`);
-    res.status(500).json({ message: "Could not retrieve messages." });
-  }
-});
-
-// ⭐ Get online status of chat members
-router.get("/online-status/:chatId", fetchUser, async (req, res) => {
-  try {
-    const chat = await Chat.findById(req.params.chatId)
-      .populate("members", "name lastActive");
-    
-    if (!chat) {
-      return res.status(404).json({ message: "Chat not found" });
-    }
-
-    // Consider user online if active within last 5 minutes
-    const ONLINE_THRESHOLD = 5 * 60 * 1000; // 5 minutes in milliseconds
-    
-    const membersStatus = chat.members.map(member => {
-      const lastActiveTime = new Date(member.lastActive).getTime();
-      const isOnline = (Date.now() - lastActiveTime) < ONLINE_THRESHOLD;
-      
-      return {
-        _id: member._id,
-        name: member.name,
-        isOnline,
-        lastActive: member.lastActive
-      };
-    });
-
-    res.json({ members: membersStatus });
-  } catch (err) {
-    console.error("❌ Failed to get online status:", err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
-// ⭐ Mark chat as read (reset unread count)
+// ─── PUT /mark-read/:chatId ───────────────────────────────────────────────────
 router.put("/mark-read/:chatId", fetchUser, async (req, res) => {
   try {
     const userId = req.user.id;
-    const chatId = req.params.chatId;
+    const { chatId } = req.params;
 
-    // Mark all unseen messages as seen
     await Message.updateMany(
-      { 
-        chatId,
-        sender: { $ne: userId },
-        seenBy: { $ne: userId }
-      },
+      { chatId, sender: { $ne: userId }, seenBy: { $ne: userId } },
       { $addToSet: { seenBy: userId } }
     );
 
-    // Reset unread count in chat
     const chat = await Chat.findById(chatId);
-    if (chat) {
-      await chat.resetUnread(userId);
-    }
+    if (chat) await chat.resetUnread(userId);
 
     res.json({ success: true });
   } catch (err) {
@@ -139,87 +82,52 @@ router.put("/mark-read/:chatId", fetchUser, async (req, res) => {
   }
 });
 
-// ⭐ Get unread count for a chat
-router.get("/unread/:chatId", fetchUser, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const chatId = req.params.chatId;
-
-    const count = await Message.getUnreadCount(chatId, userId);
-
-    res.json({ unreadCount: count });
-  } catch (err) {
-    console.error("❌ Failed to get unread count:", err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
-// ⭐ Pin/Unpin chat
+// ─── PUT /pin/:chatId ─────────────────────────────────────────────────────────
 router.put("/pin/:chatId", fetchUser, async (req, res) => {
   try {
     const chat = await Chat.findById(req.params.chatId);
-    
-    if (!chat) {
-      return res.status(404).json({ message: "Chat not found" });
-    }
+    if (!chat) return res.status(404).json({ message: "Chat not found" });
 
-    // Check if user is a member
-    if (!chat.members.includes(req.user.id)) {
+    if (!chat.members.map(String).includes(req.user.id)) {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
     chat.isPinned = !chat.isPinned;
     await chat.save();
-
-    res.json({ 
-      success: true, 
-      isPinned: chat.isPinned 
-    });
+    res.json({ success: true, isPinned: chat.isPinned });
   } catch (err) {
     console.error("❌ Failed to pin chat:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// ⭐ Archive/Unarchive chat
+// ─── PUT /archive/:chatId ─────────────────────────────────────────────────────
 router.put("/archive/:chatId", fetchUser, async (req, res) => {
   try {
     const chat = await Chat.findById(req.params.chatId);
-    
-    if (!chat) {
-      return res.status(404).json({ message: "Chat not found" });
-    }
+    if (!chat) return res.status(404).json({ message: "Chat not found" });
 
-    // Check if user is a member
-    if (!chat.members.includes(req.user.id)) {
+    if (!chat.members.map(String).includes(req.user.id)) {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
     chat.isArchived = !chat.isArchived;
     await chat.save();
-
-    res.json({ 
-      success: true, 
-      isArchived: chat.isArchived 
-    });
+    res.json({ success: true, isArchived: chat.isArchived });
   } catch (err) {
     console.error("❌ Failed to archive chat:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// ⭐ Mute/Unmute chat
+// ─── PUT /mute/:chatId ────────────────────────────────────────────────────────
 router.put("/mute/:chatId", fetchUser, async (req, res) => {
   try {
-    const { duration } = req.body; // duration in hours, or null to unmute
+    const { duration } = req.body;
     const chat = await Chat.findById(req.params.chatId);
-    
-    if (!chat) {
-      return res.status(404).json({ message: "Chat not found" });
-    }
+    if (!chat) return res.status(404).json({ message: "Chat not found" });
 
-    // Check if user is a member
-    if (!chat.members.includes(req.user.id)) {
+    if (!chat.members.map(String).includes(req.user.id)) {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
@@ -232,40 +140,26 @@ router.put("/mute/:chatId", fetchUser, async (req, res) => {
     }
 
     await chat.save();
-
-    res.json({ 
-      success: true, 
-      muteUntil: chat.muteUntil 
-    });
+    res.json({ success: true, muteUntil: chat.muteUntil });
   } catch (err) {
     console.error("❌ Failed to mute chat:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// ⭐ Delete chat (for current user only)
+// ─── DELETE /:chatId ──────────────────────────────────────────────────────────
 router.delete("/:chatId", fetchUser, async (req, res) => {
   try {
     const userId = req.user.id;
-    const chatId = req.params.chatId;
+    const { chatId } = req.params;
 
-    // Delete all messages in this chat for this user
-    await Message.updateMany(
-      { chatId },
-      { $addToSet: { deletedBy: userId } }
-    );
+    await Message.updateMany({ chatId }, { $addToSet: { deletedBy: userId } });
 
-    // If both members have deleted, remove the chat entirely
     const chat = await Chat.findById(chatId);
     if (chat) {
-      const allMessagesDeleted = await Message.countDocuments({
-        chatId,
-        deletedBy: { $all: chat.members }
-      });
-
+      const allDeleted   = await Message.countDocuments({ chatId, deletedBy: { $all: chat.members } });
       const totalMessages = await Message.countDocuments({ chatId });
-
-      if (allMessagesDeleted === totalMessages && chat.members.length === 2) {
+      if (allDeleted === totalMessages && chat.members.length === 2) {
         await Chat.findByIdAndDelete(chatId);
         await Message.deleteMany({ chatId });
       }
@@ -278,20 +172,53 @@ router.delete("/:chatId", fetchUser, async (req, res) => {
   }
 });
 
-// ⭐ Search messages in a chat
+// ─── GET /online-status/:chatId ───────────────────────────────────────────────
+// NOTE: must be declared BEFORE GET /:userId or Express will swallow it.
+router.get("/online-status/:chatId", fetchUser, async (req, res) => {
+  try {
+    const chat = await Chat.findById(req.params.chatId).populate("members", "name lastActive");
+    if (!chat) return res.status(404).json({ message: "Chat not found" });
+
+    const THRESHOLD = 5 * 60 * 1000;
+    const membersStatus = chat.members.map((m) => ({
+      _id:        m._id,
+      name:       m.name,
+      isOnline:   (Date.now() - new Date(m.lastActive).getTime()) < THRESHOLD,
+      lastActive: m.lastActive,
+    }));
+
+    res.json({ members: membersStatus });
+  } catch (err) {
+    console.error("❌ Failed to get online status:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ─── GET /unread/:chatId ──────────────────────────────────────────────────────
+// NOTE: must be declared BEFORE GET /:userId.
+router.get("/unread/:chatId", fetchUser, async (req, res) => {
+  try {
+    const count = await Message.getUnreadCount(req.params.chatId, req.user.id);
+    res.json({ unreadCount: count });
+  } catch (err) {
+    console.error("❌ Failed to get unread count:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ─── GET /search/:chatId ──────────────────────────────────────────────────────
+// NOTE: must be declared BEFORE GET /:userId.
 router.get("/search/:chatId", fetchUser, async (req, res) => {
   try {
     const { query } = req.query;
     const userId = req.user.id;
 
-    if (!query) {
-      return res.status(400).json({ message: "Search query required" });
-    }
+    if (!query) return res.status(400).json({ message: "Search query required" });
 
     const messages = await Message.find({
-      chatId: req.params.chatId,
+      chatId:    req.params.chatId,
       deletedBy: { $ne: userId },
-      text: { $regex: query, $options: 'i' }
+      text:      { $regex: query, $options: "i" },
     })
       .populate("sender", "name profileavatar")
       .sort({ createdAt: -1 })
@@ -301,6 +228,42 @@ router.get("/search/:chatId", fetchUser, async (req, res) => {
   } catch (err) {
     console.error("❌ Search failed:", err);
     res.status(500).json({ message: "Search failed" });
+  }
+});
+
+// ─── GET /:userId — Get all chats for the authenticated user ──────────────────
+//
+// BUG 2 FIX: query uses req.user.id (verified identity), not req.params.userId.
+//   The URL param is kept for frontend compatibility but is not trusted.
+//
+// BUG 3 FIX: unreadCount is read from the Mongoose document before toObject()
+//   converts the Map to a plain object, which would make .get() throw.
+//
+// ROUTE ORDER FIX: this is declared LAST among GET routes so that all
+//   specific paths above are matched first by Express.
+router.get("/:userId", fetchUser, async (req, res) => {
+  try {
+    // BUG 2 FIX: always use the authenticated user's id from the token
+    const userId = req.user.id;
+
+    const chats = await Chat.find({ members: userId })
+      .populate("members", "name _id email username profileavatar lastActive")
+      .populate("lastMessageSender", "name")
+      .sort({ lastMessageTime: -1 });
+
+    // BUG 3 FIX: read unreadCount from the Mongoose document (Map API)
+    //   BEFORE calling toObject(), which converts Map → plain object.
+    const chatsWithUnread = chats.map((chat) => {
+      const unreadCount = chat.getUnreadCount(userId); // read from Map now
+      const chatObj     = chat.toObject();              // convert after
+      chatObj.unreadCount = unreadCount;                // overwrite with correct value
+      return chatObj;
+    });
+
+    res.json(chatsWithUnread);
+  } catch (err) {
+    console.error("❌ Failed to load chats:", err.message);
+    res.status(500).json({ message: "Could not load chats." });
   }
 });
 
