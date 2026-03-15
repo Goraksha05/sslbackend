@@ -319,7 +319,8 @@ exports.loginUser = async (req, res) => {
         email: user.email,
         phone: user.phone,
         username: user.username,
-        isAdmin: user.isAdmin,
+        isAdmin: user.role === 'admin' || user.role === 'super_admin',
+        isSuperAdmin: user.role === 'super_admin',
         subscription: user.subscription,
         referralId: user.referralId,
         lastActive: user.lastActive
@@ -391,7 +392,9 @@ exports.getUserById = async (req, res) => {
         email: user.email,
         phone: user.phone,
         username: user.username,
-        isAdmin: user.isAdmin,
+        // Derive isAdmin from role so super_admin is recognised client-side
+        isAdmin: user.role === 'admin' || user.role === 'super_admin',
+        isSuperAdmin: user.role === 'super_admin',
         subscription: user.subscription,
         referralId: user.referralId
       }

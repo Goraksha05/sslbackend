@@ -42,7 +42,7 @@ const fetchUser = async (req, res, next) => {
       return res.status(401).json({ error: 'Access denied: Invalid token payload.' });
     }
 
-    const user = await User.findById(data.user.id).select('name email role banned');
+    const user = await User.findById(data.user.id).select('name email role banned adminRole adminPermissions').populate('adminRole', 'permissions roleName');
 
     if (!user) {
       return res.status(401).json({ error: 'Access denied: User not found.' });
@@ -54,11 +54,25 @@ const fetchUser = async (req, res, next) => {
       return res.status(403).json({ error: 'Account restricted.' });
     }
 
+    const isSuperAdmin = user.role === 'super_admin';
+    let permissions = [];
+    if (isSuperAdmin) {
+      permissions = ['*'];
+    } else if (user.role === 'admin') {
+      const rolePerms = user.adminRole?.permissions ?? [];
+      const userPerms = user.adminPermissions ?? [];
+      permissions = [...new Set([...rolePerms, ...userPerms])];
+    }
+
     req.user = {
-      id: user._id.toString(),
-      name: user.name,
-      email: user.email,
-      isAdmin: user.role === 'admin'
+      id:           user._id.toString(),
+      name:         user.name,
+      email:        user.email,
+      role:         user.role,
+      isAdmin:      user.role === 'admin' || isSuperAdmin,
+      isSuperAdmin,
+      permissions,
+      adminRoleName: user.adminRole?.roleName ?? null,
     };
 
     // Update lastActive (fire-and-forget — do not block the request)
