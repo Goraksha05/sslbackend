@@ -5,34 +5,40 @@
 
 const notificationRoutes = {
   // 🔥 Streaks
-  streak_reminder:    "/streaks",
-  daily_streak:       "/streaks",
-  streak_reward:      "/streaks",
+  streak_reminder: "/streaks",
+  daily_streak: "/streaks",
+  streak_reward: "/streaks",
 
   // 💳 Payments & Subscription
   expiry_reminder_7d: "/rewards",
   expiry_reminder_1d: "/rewards",
-  payment_success:    "/rewards",
-  auto_renew:         "/rewards",
+  payment_success: "/rewards",
+  auto_renew: "/rewards",
 
   // 👥 Social / Friends
-  friend_request:     "/notifications",
-  friend_accept:      "/notifications",
-  friend_decline:     "/notifications",
-  comment:            "/notifications",
-  like:               "/notifications",
+  friend_request: "/notifications",
+  friend_accept: "/notifications",
+  friend_decline: "/notifications",
+  comment: "/notifications",
+  like: "/notifications",
 
   // 👤 Referrals
-  referral_signup:    "/referrals",
-  referral_reward:    "/referrals",
-  referral_activation:"/referrals",
+  referral_signup: "/referrals",
+  referral_reward: "/referrals",
+  referral_activation: "/referrals",
 
   // 📝 Posts
-  post_reward:        "/posts",
-  post_deleted:       "/posts",   // was missing — now included
+  post_reward: "/posts",
+  post_deleted: "/posts",   // was missing — now included
 
   // 🛠️ Fallback
-  custom:             "/",
+  custom: "/",
+
+  // eKYC
+  kyc_required: "/kyc",
+  kyc_verified: "/profile",
+  kyc_rejected: "/kyc"
+
 };
 
 /**

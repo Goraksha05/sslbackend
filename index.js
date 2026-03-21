@@ -20,6 +20,7 @@
 
 require('dotenv').config({ override: true });
 require('./jobs/accountDeletionJob');
+require('./jobs/kycReminderJob');
 
 // ── Startup environment guard ─────────────────────────────────────────────────
 const REQUIRED_ENV = [
@@ -39,15 +40,15 @@ if (missing.length) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-const express     = require('express');
-const mongoose    = require('mongoose');
-const path        = require('path');
-const cors        = require('cors');
-const http        = require('http');
-const helmet      = require('helmet');
+const express = require('express');
+const mongoose = require('mongoose');
+const path = require('path');
+const cors = require('cors');
+const http = require('http');
+const helmet = require('helmet');
 const compression = require('compression');
-const morgan      = require('morgan');
-const cloudinary  = require('cloudinary').v2;
+const morgan = require('morgan');
+const cloudinary = require('cloudinary').v2;
 const cookieParser = require('cookie-parser');
 
 const { initializeSocket, getIO } = require('./sockets/IOsocket');
@@ -55,7 +56,7 @@ const { authLimiter, otpLimiter, apiLimiter } = require('./middleware/rateLimite
 
 const PORT = process.env.PORT || 5000;
 
-const app    = express();
+const app = express();
 const server = http.createServer(app);
 
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
@@ -77,21 +78,21 @@ app.use(
     crossOriginEmbedderPolicy: false,
     contentSecurityPolicy: {
       directives: {
-        defaultSrc:  ["'self'"],
-        imgSrc:      ["'self'", 'data:', 'blob:',
-                      'https://res.cloudinary.com',
-                      'http://localhost:5000', 'http://127.0.0.1:5000',
-                      'https://api.sosholife.com'],
-        mediaSrc:    ["'self'", 'blob:',
-                      'http://localhost:5000', 'http://127.0.0.1:5000',
-                      'https://api.sosholife.com'],
-        scriptSrc:   ["'self'"],
-        styleSrc:    ["'self'", "'unsafe-inline'"],
-        connectSrc:  ["'self'",
-                      'ws://localhost:5000', 'ws://127.0.0.1:5000',
-                      'wss://sosholife.com',
-                      'http://localhost:5000', 'http://127.0.0.1:5000',
-                      'https://api.sosholife.com'],
+        defaultSrc: ["'self'"],
+        imgSrc: ["'self'", 'data:', 'blob:',
+          'https://res.cloudinary.com',
+          'http://localhost:5000', 'http://127.0.0.1:5000',
+          'https://api.sosholife.com'],
+        mediaSrc: ["'self'", 'blob:',
+          'http://localhost:5000', 'http://127.0.0.1:5000',
+          'https://api.sosholife.com'],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        connectSrc: ["'self'",
+          'ws://localhost:5000', 'ws://127.0.0.1:5000',
+          'wss://sosholife.com',
+          'http://localhost:5000', 'http://127.0.0.1:5000',
+          'https://api.sosholife.com'],
       },
     },
   })
@@ -104,7 +105,7 @@ const ALLOWED_ORIGINS = (process.env.FRONTEND_BASE_URL || '')
   .filter(Boolean)
   .concat(
     process.env.NODE_ENV !== 'production'
-      ? ['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000', 'http://127.0.0.1:3001']
+      ? ['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000', 'http://127.0.0.1:3001', 'http://192.168.1.3:3000', 'http://192.168.1.3:3001']
       : []
   );
 
@@ -170,7 +171,7 @@ mongoose
 // ── Cloudinary ────────────────────────────────────────────────────────────────
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
@@ -196,9 +197,9 @@ app.get('/api/health', (req, res) => {
 //
 // In Express, middleware must be registered BEFORE the route to take effect.
 // We register specific-path limiters first, then the full auth router.
-app.use('/api/auth/login',                   authLimiter);
-app.use('/api/auth/createuser',              authLimiter);
-app.use('/api/auth/check-phone',             authLimiter);
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/createuser', authLimiter);
+app.use('/api/auth/check-phone', authLimiter);
 app.use('/api/auth/reset-password-with-otp', authLimiter);
 app.use('/api/auth', require('./routes/auth'));
 
@@ -208,7 +209,7 @@ app.use('/api/otp', otpLimiter, require('./routes/otp'));
 // GET /api/auth/earned-rewards (Home.js, ObtainedRewardsModal.js) keep working.
 // Also mounted on /api/rewards for the new canonical path.
 const earnedRewardsRouter = require('./routes/earnedRewards');
-app.use('/api/auth',    earnedRewardsRouter);
+app.use('/api/auth', earnedRewardsRouter);
 app.use('/api/rewards', earnedRewardsRouter);
 
 // General API rate limiter — applied AFTER /api/auth and /api/otp so those
@@ -220,16 +221,17 @@ app.use('/api', (req, res, next) => {
   return apiLimiter(req, res, next);
 });
 
-app.use('/api/posts',         require('./routes/posts'));
-app.use('/api/profile',       require('./routes/profile'));
-app.use('/api/activity',      require('./routes/activity'));
-app.use('/api/friends',       require('./routes/friends'));
+app.use('/api/posts', require('./routes/posts'));
+app.use('/api/profile', require('./routes/profile'));
+app.use('/api/activity', require('./routes/activity'));
+app.use('/api/friends', require('./routes/friends'));
 app.use('/api/notifications', require('./routes/notifications'));
-app.use('/api/payment',       require('./routes/payment'));
-app.use('/api/rewards',       require('./routes/userRewardSlabs'));
+app.use('/api/payment', require('./routes/payment'));
+app.use('/api/rewards', require('./routes/userRewardSlabs'));
 
 // Account delete action routes:
 app.use('/api/account', require('./routes/accountDeletion'));
+
 
 // Admin routes — protected at router level
 const fetchUserMw = require('./middleware/fetchuser')
@@ -240,13 +242,30 @@ adminRouter.use(isAdmin); // Guard ALL admin sub-routes at the router level
 adminRouter.use(require('./routes/adminRewards'));
 adminRouter.use(require('./routes/adminRoutes'));
 app.use('/api/admin', adminRouter);
+// User KYC routes:
+app.use('/api/kyc', require('./routes/adminKycRoutes'));
 
-app.use('/api/upload',  require('./routes/upload'));
-app.use('/api/chat',    require('./routes/chat'));
+app.use('/api/upload', require('./routes/upload'));
+app.use('/api/chat', require('./routes/chat'));
 app.use('/api/message', require('./routes/message'));
-app.use('/api/status',  require('./routes/status'));
-app.use('/api',         require('./routes/search'));
-app.use('/api/push',    require('./routes/push'));
+app.use('/api/status', require('./routes/status'));
+app.use('/api', require('./routes/search'));
+app.use('/api/push', require('./routes/push'));
+
+
+// Trust & Safety routes
+app.use('/api/trust', require('./routes/trustRoutes'));
+
+// Nightly jobs (after existing cron jobs)
+const cron = require('node-cron');
+const { runVectorBuilderJob } = require('./jobs/vectorBuilderJob');
+const { runGraphAlgorithmsJob } = require('./jobs/graphAlgorithmsJob');
+const { runNightlyRescorer } = require('./jobs/nightly_rescorer');
+
+cron.schedule('0 20 * * *', runVectorBuilderJob);    // 02:00 IST
+cron.schedule('30 21 * * *', runGraphAlgorithmsJob);  // 03:00 IST
+cron.schedule('30 22 * * *', runNightlyRescorer);     // 04:00 IST
+
 
 // ── Global error handler ──────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars
@@ -302,4 +321,4 @@ function shutdown(signal) {
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGINT', () => shutdown('SIGINT'));

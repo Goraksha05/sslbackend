@@ -100,8 +100,8 @@ exports.createUser = async (req, res) => {
         existingUser.email === email
           ? 'email'
           : existingUser.phone === phone
-          ? 'phone number'
-          : 'username';
+            ? 'phone number'
+            : 'username';
       return res.status(409).json({ success: false, error: `A user with this ${field} already exists.` });
     }
 
@@ -146,7 +146,7 @@ exports.createUser = async (req, res) => {
       }).catch(err => console.error('Notification create failed:', err.message));
 
       // In-app + push notifications (fire-and-forget — non-critical)
-      notifyUser(referrer._id, `${newUser.name} joined using your referral code! 🎉`, 'referral_signup').catch(() => {});
+      notifyUser(referrer._id, `${newUser.name} joined using your referral code! 🎉`, 'referral_signup').catch(() => { });
       sendPushToUser(referrer._id.toString(), {
         title: 'New Referral Signup',
         message: `${newUser.name} just created an account with your referral!`,
@@ -235,6 +235,12 @@ exports.createUser = async (req, res) => {
   } catch (error) {
     console.error('createUser error:', error);
     res.status(500).json({ success: false, message: 'Internal Server Error' });
+  };
+
+  //----------------- Record referral edge in device graph ------------------
+  if (referrer) {
+    const { recordReferral } = require('../services/deviceGraphUpdater');
+    setImmediate(() => recordReferral(referrer._id, savedUser._id).catch(console.error));
   }
 };
 
@@ -286,6 +292,33 @@ exports.loginUser = async (req, res) => {
       }
     };
     const authtoken = signToken(payload);
+
+    // Trust & Safety: update device graph on login
+    const fpHash = req.headers['x-fp-hash'] || null;
+    const { recordLogin } = require('../services/deviceGraphUpdater');
+    const { computeMultiAccountScore } = require('../services/multiAccountScorer');
+    const { executeDefenseActions } = require('../services/defenseActions');
+
+    // Fire-and-forget — don't delay login response
+    setImmediate(async () => {
+      try {
+        await recordLogin(user._id, fpHash, req.ip);
+        const result = await computeMultiAccountScore(user._id, { fpHash, ip: req.ip });
+        if (result.tier !== 'clean') {
+          await executeDefenseActions(user._id, result, 'login', { fpHash, ip: req.ip });
+        }
+      } catch (err) {
+        console.error('[trust/login]', err.message);
+      }
+    });
+
+    if (user.kyc?.status === 'required') {
+      notifyUser(
+        user._id,
+        '⚠️ Please complete your KYC',
+        'kyc_required'
+      );
+    }
 
     // Login notification (non-critical, fire-and-forget)
     try {

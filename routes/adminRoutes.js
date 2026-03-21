@@ -1,7 +1,13 @@
-// routes/adminRoutes.js  ← REPLACES existing adminRoutes.js
-// All original endpoints kept intact; each now carries an appropriate
+// routes/adminRoutes.js
+// All original endpoints kept intact; each carries the appropriate
 // checkPermission() guard alongside the existing fetchUser + isAdmin chain.
-// New admin-management, role-management and audit-log endpoints added.
+// Admin-management, role-management and audit-log endpoints wired.
+//
+// ── NEW in this version ──────────────────────────────────────────────────────
+//   POST /create-admin  — super_admin creates a brand-new admin account
+//                         (replaces the old /register dual-mode approach).
+//                         Called by AdminCreateUser.js (post-login only).
+// ─────────────────────────────────────────────────────────────────────────────
 
 const express    = require('express');
 const router     = express.Router();
@@ -13,8 +19,8 @@ const { undoRedemption } = require('../utils/undoRewardRedemption');
 const RewardClaim = require('../models/RewardClaim');
 const mgmt       = require('../controllers/adminManagementController');
 
-// Convenience alias – keeps all existing route files that imported `isAdmin`
-// working without touching them, since verifyAdmin is equivalent.
+// Convenience alias — keeps all existing route files that imported `isAdmin`
+// working without touching them.
 const isAdmin = verifyAdmin;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -35,8 +41,8 @@ router.get('/users', fetchUser, isAdmin, checkPermission('view_users'), async (r
 // GET /api/admin/rewards
 router.get('/rewards', fetchUser, isAdmin, checkPermission('view_rewards'), async (req, res) => {
   try {
-    const referralRewards = await Activity.find({ referral: { $exists: true }, slabAwarded: { $exists: true } }).populate('user');
-    const postRewards     = await Activity.find({ userpost: { $exists: true }, slabAwarded: { $exists: true } }).populate('user');
+    const referralRewards = await Activity.find({ referral:   { $exists: true }, slabAwarded: { $exists: true } }).populate('user');
+    const postRewards     = await Activity.find({ userpost:   { $exists: true }, slabAwarded: { $exists: true } }).populate('user');
     const streakRewards   = await Activity.find({ streakslab: { $exists: true } }).populate('user');
     res.status(200).json({ referralRewards, postRewards, streakRewards });
   } catch (err) {
@@ -107,13 +113,34 @@ router.get('/reward-claims', fetchUser, isAdmin, checkPermission('approve_reward
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// NEW: CREATE ADMIN ACCOUNT  (super_admin only)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// POST /api/admin/create-admin
+//
+// Called by: AdminCreateUser.js (pages/AdminCreateUser.js) — only after
+// super_admin is logged in and navigates to /admin/create-admin.
+//
+// Body: { name, username, email, phone, password, roleId, permissions? }
+//
+// What makes this different from POST /api/auth/createuser:
+//   ✅ No referral code required — internal accounts are exempt
+//   ✅ No OTP verification       — super_admin is trusted
+//   ✅ Sets role:'admin', isAdmin:true, adminRole immediately
+//   ✅ Optional per-permission override via `permissions[]`
+//   ✅ Does NOT log the new admin in — they log in separately
+//   ✅ Writes an audit log entry
+
+router.post('/create-admin', fetchUser, verifySuperAdmin, mgmt.createAdmin);
+
+// ════════════════════════════════════════════════════════════════════════════
 // ADMIN MANAGEMENT  (super_admin only for create/delete/role-change)
 // ════════════════════════════════════════════════════════════════════════════
 
-router.get(   '/admins',            fetchUser, isAdmin,         checkPermission('manage_admins'), mgmt.listAdmins);
-router.post(  '/admins',            fetchUser, verifySuperAdmin,                                  mgmt.promoteAdmin);
-router.put(   '/admins/:id/role',   fetchUser, verifySuperAdmin,                                  mgmt.changeAdminRole);
-router.delete('/admins/:id',        fetchUser, verifySuperAdmin,                                  mgmt.demoteAdmin);
+router.get(   '/admins',          fetchUser, isAdmin,         checkPermission('manage_admins'), mgmt.listAdmins);
+router.post(  '/admins',          fetchUser, verifySuperAdmin,                                  mgmt.promoteAdmin);
+router.put(   '/admins/:id/role', fetchUser, verifySuperAdmin,                                  mgmt.changeAdminRole);
+router.delete('/admins/:id',      fetchUser, verifySuperAdmin,                                  mgmt.demoteAdmin);
 
 // ════════════════════════════════════════════════════════════════════════════
 // ROLE MANAGEMENT  (super_admin only)
@@ -144,16 +171,6 @@ router.get('/permissions', fetchUser, verifySuperAdmin, (req, res) => {
 // CURRENT ADMIN PROFILE  (any admin can call this)
 // ════════════════════════════════════════════════════════════════════════════
 
-router.get('/me', fetchUser, isAdmin, (req, res) => {
-  res.json({
-    id:           req.user.id,
-    email:        req.user.email,
-    name:         req.user.name,
-    role:         req.user.role,
-    isSuperAdmin: req.user.isSuperAdmin,
-    permissions:  req.user.permissions,
-    adminRoleName: req.user.adminRoleName,
-  });
-});
+router.get('/me', fetchUser, isAdmin, mgmt.getMe);
 
 module.exports = router;

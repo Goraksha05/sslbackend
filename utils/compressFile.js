@@ -1,5 +1,6 @@
 const path = require("path");
-const fs = require("fs");
+const fs  = require("fs");
+const fsp = require("fs/promises");
 const sharp = require("sharp");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
@@ -9,6 +10,45 @@ const util = require("util");
 libre.convertAsync = util.promisify(libre.convert);
 
 ffmpeg.setFfmpegPath(ffmpegPath);
+
+// Disable libvips tile cache so sharp releases file handles immediately after
+// a pipeline completes. Without this on Windows, the OS returns EPERM when
+// we try to unlink the source file right after sharp finishes writing output.
+sharp.cache(false);
+
+/**
+ * Unlink a file with retry on EPERM/EBUSY (Windows file-handle timing issue).
+ * Sharp and antivirus scanners can briefly hold a handle after the async
+ * pipeline resolves. A short back-off is enough to clear it.
+ */
+async function unlinkRetry(filePath, retries = 5, delayMs = 120) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await fsp.unlink(filePath);
+      return;
+    } catch (err) {
+      const retryable = err.code === "EPERM" || err.code === "EBUSY";
+      if (!retryable || attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, delayMs * attempt));
+    }
+  }
+}
+
+/**
+ * Rename a file with retry on EPERM/EBUSY.
+ */
+async function renameRetry(src, dest, retries = 5, delayMs = 120) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await fsp.rename(src, dest);
+      return;
+    } catch (err) {
+      const retryable = err.code === "EPERM" || err.code === "EBUSY";
+      if (!retryable || attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, delayMs * attempt));
+    }
+  }
+}
 
 // Guess mimetype if multer didn’t provide it
 const guessMimeType = (ext) => {
@@ -86,7 +126,7 @@ const compressFile = async (filePath, mimetype) => {
       const pdfBuf = await libre.convertAsync(docxBuf, ".pdf", undefined);
       const pdfPath = path.join(dir, `${base}.pdf`);
       fs.writeFileSync(pdfPath, pdfBuf);
-      fs.unlinkSync(filePath);
+      await unlinkRetry(filePath);
       filePath = pdfPath;
       outputPath = path.join(dir, `${base}-compressed.pdf`);
       ext = ".pdf";
@@ -119,9 +159,11 @@ const compressFile = async (filePath, mimetype) => {
     }
 
     // Replace original with compressed
+    // Both operations are async+retry to avoid EPERM on Windows where
+    // sharp or antivirus can briefly hold the source file handle.
     if (fs.existsSync(outputPath)) {
-      fs.unlinkSync(filePath);
-      fs.renameSync(outputPath, filePath);
+      await unlinkRetry(filePath);
+      await renameRetry(outputPath, filePath);
     }
 
     // Cleanup old thumbs
@@ -130,7 +172,8 @@ const compressFile = async (filePath, mimetype) => {
         file.includes(`${base}-thumb`) &&
         !thumbnails.includes(path.join(dir, file))
       ) {
-        fs.unlinkSync(path.join(dir, file));
+        // Best-effort cleanup — ignore errors (non-critical stale thumbs)
+        try { fs.unlinkSync(path.join(dir, file)); } catch (_) {}
       }
     });
 

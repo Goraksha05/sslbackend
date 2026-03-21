@@ -17,7 +17,7 @@
  *   REFERRAL — milestones 3,6,10 (grocery+shares+token) + 11–30 (referralToken only)
  */
 
-const User        = require('../models/User');
+const User = require('../models/User');
 const RewardClaim = require('../models/RewardClaim');
 const { readRewards } = require('../utils/rewardManager');
 
@@ -69,8 +69,8 @@ function extractReward(slab) {
   if (!slab) return null;
   return {
     groceryCoupons: slab.groceryCoupons ?? 0,
-    shares:         slab.shares         ?? 0,
-    referralToken:  slab.referralToken  ?? 0,
+    shares: slab.shares ?? 0,
+    referralToken: slab.referralToken ?? 0,
   };
 }
 
@@ -88,9 +88,18 @@ async function getEarnedRewards(req, res) {
 
     // Load slab configs — non-fatal if a file is missing
     let streakSlabs = [], referralSlabs = [], postSlabs = [];
-    try { streakSlabs   = readRewards('streak',   planKey); } catch (e) { console.warn('[earnedRewards] streak slabs:', e.message); }
+    try { streakSlabs = readRewards('streak', planKey); } catch (e) { console.warn('[earnedRewards] streak slabs:', e.message); }
     try { referralSlabs = readRewards('referral', planKey); } catch (e) { console.warn('[earnedRewards] referral slabs:', e.message); }
-    try { postSlabs     = readRewards('posts',    planKey); } catch (e) { console.warn('[earnedRewards] post slabs:', e.message); }
+    try { postSlabs = readRewards('posts', planKey); } catch (e) { console.warn('[earnedRewards] post slabs:', e.message); }
+
+    // ───────────── Fraud / Risk Guard ─────────────
+    if (user.trustFlags?.rewardsFrozen) {
+      return res.status(403).json({
+        message: 'Your reward payouts are temporarily suspended pending verification.',
+        code: 'REWARDS_FROZEN',
+        kycRequired: user.trustFlags?.kycRequired || false,
+      });
+    }
 
     // Fetch full RewardClaim history (most accurate record of what was awarded)
     const claims = await RewardClaim.find({ user: user._id })
@@ -99,23 +108,23 @@ async function getEarnedRewards(req, res) {
 
     // Enrich each claim with its resolved slab breakdown + display metadata
     const enrichedClaims = claims.map(claim => {
-      let slab  = null;
+      let slab = null;
       let title = '';
       let emoji = '🎁';
       let cardType = claim.type; // 'streak' | 'referral' | 'post'
 
       if (claim.type === 'streak') {
-        slab  = lookupStreakSlab(streakSlabs, claim.milestone);
+        slab = lookupStreakSlab(streakSlabs, claim.milestone);
         const days = String(claim.milestone).replace('days', '');
         title = `Streak Reward — ${days} Days`;
         emoji = '🔥';
       } else if (claim.type === 'referral') {
-        slab  = lookupReferralSlab(referralSlabs, claim.milestone);
+        slab = lookupReferralSlab(referralSlabs, claim.milestone);
         const isBigSlab = [3, 6, 10].includes(Number(claim.milestone));
         title = `Referral Reward — ${claim.milestone} Referral${Number(claim.milestone) !== 1 ? 's' : ''}`;
         emoji = isBigSlab ? '🤝' : '🪙';
       } else if (claim.type === 'post') {
-        slab  = lookupPostSlab(postSlabs, claim.milestone);
+        slab = lookupPostSlab(postSlabs, claim.milestone);
         title = `Post Reward — ${claim.milestone} Posts`;
         emoji = '📝';
       }
@@ -123,8 +132,8 @@ async function getEarnedRewards(req, res) {
       const reward = extractReward(slab);
 
       return {
-        _id:       claim._id,
-        type:      cardType,
+        _id: claim._id,
+        type: cardType,
         milestone: claim.milestone,
         claimedAt: claim.claimedAt || claim.createdAt,
         title,
@@ -140,27 +149,27 @@ async function getEarnedRewards(req, res) {
     // Wallet totals — always from User doc (canonical ledger)
     const wallet = {
       totalGroceryCoupons: user.totalGroceryCoupons ?? 0,
-      totalShares:         user.totalShares         ?? 0,
-      totalReferralToken:  user.totalReferralToken  ?? 0,
+      totalShares: user.totalShares ?? 0,
+      totalReferralToken: user.totalReferralToken ?? 0,
     };
 
     // Redeemed slab lists (for disabling already-claimed buttons in the UI)
     const redeemed = {
-      streak:   user.redeemedStreakSlabs   ?? [],   // e.g. ['30days', '90days']
+      streak: user.redeemedStreakSlabs ?? [],   // e.g. ['30days', '90days']
       referral: user.redeemedReferralSlabs ?? [],   // e.g. [3, 6, 10, 11]
-      posts:    user.redeemedPostSlabs     ?? [],   // e.g. [30, 70]
+      posts: user.redeemedPostSlabs ?? [],   // e.g. [30, 70]
     };
 
     // Slab configs (so the frontend can show reward preview per milestone)
     const slabs = {
-      streak:   streakSlabs,
+      streak: streakSlabs,
       referral: referralSlabs,
-      posts:    postSlabs,
+      posts: postSlabs,
     };
 
     // Referral slab classification (big vs token-only) for UI rendering
     const referralMeta = {
-      bigMilestones:   referralSlabs.filter(s => s.groceryCoupons > 0 || s.shares > 0).map(s => s.referralCount),
+      bigMilestones: referralSlabs.filter(s => s.groceryCoupons > 0 || s.shares > 0).map(s => s.referralCount),
       tokenMilestones: referralSlabs.filter(s => s.groceryCoupons === 0 && s.shares === 0 && s.referralToken > 0).map(s => s.referralCount),
     };
 
