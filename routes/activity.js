@@ -11,6 +11,9 @@ const RewardClaim = require('../models/RewardClaim');
 const Notification = require('../models/Notification');
 const fetchUser   = require('../middleware/fetchuser');
 
+// ── NEW: Reward eligibility gate (KYC + subscription) ─────────────────────────
+const requireRewardEligibility = require('../middleware/requireRewardEligibility');
+
 const { calculateReferralReward } = require('../utils/tierCalculation/calculateReferralReward');
 const { calculatePostsReward }    = require('../utils/tierCalculation/calculatePostsReward');
 const { calculateStreakReward }   = require('../utils/tierCalculation/calculateStreakReward');
@@ -22,17 +25,12 @@ const { getCommunityCount } = require('../utils/communityUtils');
 
 /* ── Helpers ─────────────────────────────────────────────────────────────────── */
 
-/**
- * Derive the plan key used to look up reward JSON files.
- * Supports both subscription.planAmount (number) and subscription.plan (string).
- */
 function planKeyFromUser(user) {
   if (user.subscription?.planAmount) return String(user.subscription.planAmount);
   const nameMap = { Basic: '2500', Silver: '3500', Gold: '4500' };
   return nameMap[user.subscription?.plan] || '2500';
 }
 
-/** Merge bank details into the user document (no separate save). */
 function mergeBankDetails(user, bankDetails) {
   if (!bankDetails) return;
   user.bankDetails = {
@@ -42,7 +40,6 @@ function mergeBankDetails(user, bankDetails) {
   };
 }
 
-/** Create DB notification + socket push + web push. */
 async function notifyAndPush(userId, type, message, url) {
   try {
     await Notification.create({ user: userId, sender: userId, type, message, url });
@@ -50,13 +47,15 @@ async function notifyAndPush(userId, type, message, url) {
     sendPushToUser(userId, { title: message.split('!')[0], message, url });
     getIO().to(userId.toString()).emit('notification', { type, from: userId, message });
   } catch (err) {
-    // Notification failure must never abort a reward claim
     console.error('[notifyAndPush] non-fatal error:', err.message);
   }
 }
 
 /* ── Referral Reward ─────────────────────────────────────────────────────────── */
-router.post('/referral', fetchUser, async (req, res) => {
+// requireRewardEligibility enforces KYC verified + active subscription BEFORE
+// any business logic runs. The individual subscription checks below are kept as
+// a secondary safety net but the gate middleware is the primary enforcement.
+router.post('/referral', fetchUser, requireRewardEligibility, async (req, res) => {
   try {
     const { referralCount, bankDetails } = req.body;
     const count = Number(referralCount);
@@ -66,10 +65,24 @@ router.post('/referral', fetchUser, async (req, res) => {
     }
 
     const user = await User.findById(req.user.id);
-    if (!user)                        return res.status(404).json({ message: 'User not found.' });
-    if (!user.subscription?.active)   return res.status(403).json({ message: 'Active subscription required to claim rewards.' });
+    if (!user) return res.status(404).json({ message: 'User not found.' });
 
-    // Verify the user actually HAS this many active referred users
+    // Secondary subscription guard (belt-and-suspenders — gate middleware is primary)
+    if (!user.subscription?.active) {
+      return res.status(403).json({
+        message: 'Active subscription required to claim rewards.',
+        code: 'SUBSCRIPTION_REQUIRED',
+      });
+    }
+
+    // Secondary KYC guard
+    if (user.kyc?.status !== 'verified') {
+      return res.status(403).json({
+        message: 'KYC verification required to claim rewards.',
+        code: 'KYC_NOT_VERIFIED',
+      });
+    }
+
     const activeReferrals = await User.countDocuments({
       referral: user._id,
       'subscription.active': true,
@@ -81,7 +94,6 @@ router.post('/referral', fetchUser, async (req, res) => {
       });
     }
 
-    // Idempotency: prevent double-claim
     if (user.redeemedReferralSlabs?.includes(count)) {
       return res.status(409).json({ message: 'You have already claimed this referral milestone.' });
     }
@@ -95,7 +107,6 @@ router.post('/referral', fetchUser, async (req, res) => {
 
     const { groceryCoupons = 0, shares = 0, referralToken = 0 } = reward;
 
-    // Persist both Activity log AND RewardClaim record
     await Promise.all([
       new Activity({
         user:        user._id,
@@ -106,7 +117,6 @@ router.post('/referral', fetchUser, async (req, res) => {
       RewardClaim.create({ user: user._id, type: 'referral', milestone: String(count) }),
     ]);
 
-    // Update user wallet — use $push / $inc on raw model for atomicity
     user.redeemedReferralSlabs.push(count);
     user.totalGroceryCoupons = (user.totalGroceryCoupons || 0) + groceryCoupons;
     user.totalShares         = (user.totalShares         || 0) + shares;
@@ -155,7 +165,7 @@ router.get('/invited/:referralId', fetchUser, async (req, res) => {
 });
 
 /* ── Post Reward ─────────────────────────────────────────────────────────────── */
-router.post('/post-reward', fetchUser, async (req, res) => {
+router.post('/post-reward', fetchUser, requireRewardEligibility, async (req, res) => {
   try {
     const { postreward, bankDetails } = req.body;
     const milestone = Number(postreward);
@@ -165,13 +175,25 @@ router.post('/post-reward', fetchUser, async (req, res) => {
     }
 
     const user = await User.findById(req.user.id);
-    if (!user)                      return res.status(404).json({ message: 'User not found.' });
-    if (!user.subscription?.active) return res.status(403).json({ message: 'Active subscription required to claim rewards.' });
+    if (!user) return res.status(404).json({ message: 'User not found.' });
 
-    // Count only approved / non-rejected posts to prevent gaming
+    if (!user.subscription?.active) {
+      return res.status(403).json({
+        message: 'Active subscription required to claim rewards.',
+        code: 'SUBSCRIPTION_REQUIRED',
+      });
+    }
+
+    if (user.kyc?.status !== 'verified') {
+      return res.status(403).json({
+        message: 'KYC verification required to claim rewards.',
+        code: 'KYC_NOT_VERIFIED',
+      });
+    }
+
     const postCount = await PostsSchema.countDocuments({
       user_id: user._id,
-      'moderation.status': { $ne: 'rejected' },   // exclude rejected posts
+      'moderation.status': { $ne: 'rejected' },
     });
 
     if (postCount < milestone) {
@@ -185,7 +207,6 @@ router.post('/post-reward', fetchUser, async (req, res) => {
     }
 
     const plan   = planKeyFromUser(user);
-    // IMPORTANT: Look up reward for the exact milestone (not the current post count)
     const reward = calculatePostsReward(milestone, plan);
 
     if (!reward) {
@@ -234,11 +255,10 @@ router.post('/post-reward', fetchUser, async (req, res) => {
 });
 
 /* ── Streak Reward ───────────────────────────────────────────────────────────── */
-router.post('/streak-reward', fetchUser, async (req, res) => {
+router.post('/streak-reward', fetchUser, requireRewardEligibility, async (req, res) => {
   try {
     const { streakslab, bankDetails } = req.body;
 
-    // Accept both "90days" and 90
     const daysRequired = Number(
       typeof streakslab === 'string' ? streakslab.replace('days', '') : streakslab
     );
@@ -250,16 +270,27 @@ router.post('/streak-reward', fetchUser, async (req, res) => {
     const slabKey = `${daysRequired}days`;
 
     const user = await User.findById(req.user.id);
-    if (!user)                      return res.status(404).json({ message: 'User not found.' });
-    if (!user.subscription?.active) return res.status(403).json({ message: 'Active subscription required to claim rewards.' });
+    if (!user) return res.status(404).json({ message: 'User not found.' });
 
-    // Count distinct calendar days with a logged streak (prevents duplicate daily logs inflating count)
+    if (!user.subscription?.active) {
+      return res.status(403).json({
+        message: 'Active subscription required to claim rewards.',
+        code: 'SUBSCRIPTION_REQUIRED',
+      });
+    }
+
+    if (user.kyc?.status !== 'verified') {
+      return res.status(403).json({
+        message: 'KYC verification required to claim rewards.',
+        code: 'KYC_NOT_VERIFIED',
+      });
+    }
+
     const streakDocs = await Activity.find({
       user:        user._id,
       dailystreak: { $exists: true, $ne: null },
     }).select('createdAt').lean();
 
-    // Deduplicate by calendar date (YYYY-MM-DD) for accurate streak count
     const uniqueDays = new Set(
       streakDocs.map(d => new Date(d.createdAt).toISOString().split('T')[0])
     );
@@ -322,11 +353,11 @@ router.post('/streak-reward', fetchUser, async (req, res) => {
 });
 
 /* ── Daily Streak Logging ────────────────────────────────────────────────────── */
+// No eligibility gate here — logging a streak is always allowed (it is not a reward claim)
 router.post('/log-daily-streak', fetchUser, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Check last streak log (by calendar day, not 24h, to align with user expectation)
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
@@ -400,7 +431,6 @@ router.get('/streak-history', fetchUser, async (req, res) => {
       dailystreak: { $exists: true },
     }).sort({ createdAt: -1 }).lean();
 
-    // Deduplicate by date, aggregate count per day
     const dateMap = new Map();
     for (const s of streaks) {
       const d = new Date(s.createdAt);
@@ -435,6 +465,49 @@ router.get('/last-streak', fetchUser, async (req, res) => {
   } catch (err) {
     console.error('[GET /last-streak]', err);
     return res.status(500).json({ message: 'Failed to fetch last streak.' });
+  }
+});
+
+/* ── Eligibility Check Endpoint ──────────────────────────────────────────────── */
+// Lightweight endpoint for the frontend to check reward eligibility without
+// hitting a claim endpoint. Returns structured gate info.
+router.get('/reward-eligibility', fetchUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id)
+      .select('kyc subscription trustFlags')
+      .lean();
+
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+
+    const kycStatus   = user.kyc?.status ?? 'not_started';
+    const kycPassed   = kycStatus === 'verified';
+    const subActive   = !!user.subscription?.active;
+    const subExpired  = subActive && user.subscription?.expiresAt
+      && new Date(user.subscription.expiresAt) < new Date();
+    const subPassed   = subActive && !subExpired;
+    const rewardsFrozen = !!user.trustFlags?.rewardsFrozen;
+
+    return res.json({
+      eligible: kycPassed && subPassed && !rewardsFrozen,
+      rewardsFrozen,
+      gates: {
+        kyc: {
+          passed:       kycPassed,
+          status:       kycStatus,
+          verifiedAt:   user.kyc?.verifiedAt ?? null,
+        },
+        subscription: {
+          passed:    subPassed,
+          active:    subActive,
+          expired:   subExpired,
+          plan:      user.subscription?.plan ?? null,
+          expiresAt: user.subscription?.expiresAt ?? null,
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[GET /reward-eligibility]', err);
+    return res.status(500).json({ message: 'Failed to check eligibility.' });
   }
 });
 

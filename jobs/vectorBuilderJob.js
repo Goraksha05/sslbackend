@@ -65,7 +65,7 @@ function stdDev(arr) {
 function processLoginIntervals(sessionStarts) {
   if (sessionStarts.length < 3) return null;
   const times = sessionStarts
-    .map(s => new Date(s.receivedAt).getTime())
+    .map(s => new Date(s.receivedOn).getTime())
     .sort((a, b) => a - b);
   const intervals = [];
   for (let i = 1; i < times.length; i++) intervals.push(times[i] - times[i - 1]);

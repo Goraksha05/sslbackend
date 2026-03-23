@@ -2,6 +2,7 @@ const express = require('express');
 const { body } = require('express-validator');
 const fetchUser = require('../middleware/fetchuser');
 const authController = require('../controllers/authController');
+// const adminAuthController = require('../controllers/adminAuthController');
 //const captchaMiddleware = require("../middleware/captcha");
 const profileController = require('../controllers/profileController');
 const User = require('../models/User');
@@ -10,7 +11,7 @@ const router = express.Router();
 
 // Auth Routes
 router.post('/createuser',
-//  captchaMiddleware,
+  //  captchaMiddleware,
   [
     body('name').isLength({ min: 3 }),
     body('username').isLength({ min: 3 }).custom(value => !/\s/.test(value)),
@@ -19,12 +20,32 @@ router.post('/createuser',
     body('password').isLength({ min: 5 })
   ], authController.createUser);
 
+
 router.post('/login',
-//  captchaMiddleware,
+  //  captchaMiddleware,
   [
     body('identifier').notEmpty(),
     body('password').exists()
   ], authController.loginUser);
+
+
+// Admin Auth Routes
+// router.post('/createadmin',
+  //  captchaMiddleware,
+  // [
+  //   body('name').isLength({ min: 3 }),
+  //   body('username').isLength({ min: 3 }).custom(value => !/\s/.test(value)),
+  //   body('email').isEmail(),
+  //   body('phone').isLength({ min: 10, max: 10 }).matches(/^\d+$/),
+  //   body('password').isLength({ min: 5 })
+  // ], adminAuthController.createAdmin);
+
+// router.post('/adminlogin',
+  //  captchaMiddleware,
+  // [
+  //   body('identifier').notEmpty(),
+  //   body('password').exists()
+  // ], adminAuthController.loginAdmin);
 
 // Profile Route
 router.get('/getuser/:id', fetchUser, profileController.getUser);

@@ -1,24 +1,22 @@
 /**
  * jobs/kycReminderJob.js
  *
- * FIXES vs original:
- *  1. Added missing `const cron = require('node-cron');` import
- *  2. Fixed notifyUser import — original used default import but
- *     notifyUser.js exports a named function, so destructure correctly
- *  3. Added graceful per-user error handling so one failure doesn't
- *     abort the entire batch
- *  4. Added platformEventBus KYC_REQUIRED event emission
- *
- * Install dependency if not already present:
- *   npm install node-cron
+ * FIX: `const { notifyUser } = require('../utils/notifyUser')` destructures
+ * a default export, yielding `undefined`. notifyUser.js does:
+ *   module.exports = notifyUser;          ← default export
+ *   module.exports.notifyMany = notifyMany;
+ * The correct import for the default is: `const notifyUser = require(...)`.
+ * Previously every call to notifyUser() threw "notifyUser is not a function"
+ * (swallowed by the per-user catch block), so zero KYC reminders were ever sent.
  */
 
 'use strict';
 
-const cron              = require('node-cron');
-const User              = require('../models/User');
-const { notifyUser }    = require('../utils/notifyUser');
-const bus               = require('../intelligence/platformEventBus');
+const cron       = require('node-cron');
+const User       = require('../models/User');
+// FIX: default import — not destructured
+const notifyUser = require('../utils/notifyUser');
+const bus        = require('../intelligence/platformEventBus');
 
 /**
  * Runs at 10:00 AM every day.
@@ -49,7 +47,7 @@ cron.schedule('0 10 * * *', async () => {
         await notifyUser(
           user._id,
           '⚠️ Complete your KYC to unlock features',
-          'kyc_required',
+          'custom',        // 'kyc_required' is not in the Notification schema enum
           { url: '/kyc' }
         );
 

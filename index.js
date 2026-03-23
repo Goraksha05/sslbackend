@@ -198,6 +198,7 @@ app.get('/api/health', (req, res) => {
 // In Express, middleware must be registered BEFORE the route to take effect.
 // We register specific-path limiters first, then the full auth router.
 app.use('/api/auth/login', authLimiter);
+app.use('/api/admin/adminlogin', authLimiter);
 app.use('/api/auth/createuser', authLimiter);
 app.use('/api/auth/check-phone', authLimiter);
 app.use('/api/auth/reset-password-with-otp', authLimiter);
