@@ -86,13 +86,19 @@ app.use(
         mediaSrc: ["'self'", 'blob:',
           'http://localhost:5000', 'http://127.0.0.1:5000',
           'https://api.sosholife.com'],
-        scriptSrc: ["'self'"],
+        scriptSrc: ["'self'",
+          'https://www.google.com',
+          'https://www.gstatic.com',
+          'https://cdn.jsdelivr.net'],
+        frameSrc: ["'self'",
+          'https://www.google.com'],
         styleSrc: ["'self'", "'unsafe-inline'"],
         connectSrc: ["'self'",
           'ws://localhost:5000', 'ws://127.0.0.1:5000',
           'wss://sosholife.com',
           'http://localhost:5000', 'http://127.0.0.1:5000',
-          'https://api.sosholife.com'],
+          'https://api.sosholife.com',
+          'https://www.google.com'],
       },
     },
   })
@@ -105,7 +111,12 @@ const ALLOWED_ORIGINS = (process.env.FRONTEND_BASE_URL || '')
   .filter(Boolean)
   .concat(
     process.env.NODE_ENV !== 'production'
-      ? ['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000', 'http://127.0.0.1:3001', 'http://192.168.1.3:3000', 'http://192.168.1.3:3001']
+      ? ['http://localhost:3000', 
+        'http://localhost:3001', 
+        'http://127.0.0.1:3000', 
+        'http://127.0.0.1:3001', 
+        'http://192.168.1.3:3000', 
+        'http://192.168.1.3:3001']
       : []
   );
 
@@ -197,9 +208,9 @@ app.get('/api/health', (req, res) => {
 //
 // In Express, middleware must be registered BEFORE the route to take effect.
 // We register specific-path limiters first, then the full auth router.
+app.use('/api/auth/createuser', authLimiter);
 app.use('/api/auth/login', authLimiter);
 app.use('/api/admin/adminlogin', authLimiter);
-app.use('/api/auth/createuser', authLimiter);
 app.use('/api/auth/check-phone', authLimiter);
 app.use('/api/auth/reset-password-with-otp', authLimiter);
 app.use('/api/auth', require('./routes/auth'));

@@ -21,7 +21,7 @@ function signToken(payload) {
 
 
 // ── Register new admin ────────────────────────────────────────────────────────
-// @route  POST /api/auth/createadmin
+// @route  POST /api/admin/createadmin
 // @access Public
 exports.createAdmin = async (req, res) => {
   const errors = validationResult(req);
@@ -29,10 +29,10 @@ exports.createAdmin = async (req, res) => {
     return res.status(400).json({ success: false, errors: errors.array() });
   }
 
-  const { name, username, email, phone, password, role } = req.body;
+  const { name, username, email, phone, password } = req.body;
 
   // Normalize role
-  const userRole = role === 'admin' ? 'admin' : 'user';
+  const userRole = role === 'admin' ? 'admin' : 'admin'; // Default to 'admin' if role is missing or invalid
 
   if (!name || !username || !email || !phone || !password) {
     return res.status(400).json({
@@ -110,7 +110,7 @@ exports.createAdmin = async (req, res) => {
 };
 
 // ── Login existing admin ──────────────────────────────────────────────────────
-// @route  POST /api/auth/adminlogin
+// @route  POST /api/admin/adminlogin
 // @access Public
 exports.loginAdmin = async (req, res) => {
   const errors = validationResult(req);
@@ -194,7 +194,7 @@ exports.loginAdmin = async (req, res) => {
 };
 
 // ── Get user by ID ───────────────────────────────────────────────────────────
-// @route  GET /api/auth/getloggeduser/:id
+// @route  GET /api/admin/getloggeduser/:id
 // @access Private
 exports.getUserById = async (req, res) => {
   try {

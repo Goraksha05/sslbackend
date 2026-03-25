@@ -18,11 +18,20 @@ module.exports = async (req, res, next) => {
     });
 
     const data = await r.json();
-    if (!data.success || (data.score && data.score < 0.5)) {
+    if (!data.success) {
       return res.status(403).json({ message: "Captcha failed" });
     }
 
+    // Optional stricter check for production
+    if (process.env.NODE_ENV === "production" && data.score < 0.5) {
+      return res.status(403).json({ message: "Low captcha score" });
+    }
+
+    console.log(req.body);
+    console.log("🔍 CAPTCHA RESPONSE:", data);
+
     next();
+
   } catch (err) {
     console.error("Captcha error:", err);
     return res.status(500).json({ message: "Captcha verification failed" });

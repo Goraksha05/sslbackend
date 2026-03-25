@@ -3,7 +3,9 @@ const { body } = require('express-validator');
 const fetchUser = require('../middleware/fetchuser');
 const authController = require('../controllers/authController');
 // const adminAuthController = require('../controllers/adminAuthController');
-//const captchaMiddleware = require("../middleware/captcha");
+// const captchaMiddleware = require("../middleware/captcha");
+// const captchaMiddleware = require("../middleware/captcha_for_v2");
+const captchaMiddleware = require("../middleware/captchaHybrid");
 const profileController = require('../controllers/profileController');
 const User = require('../models/User');
 
@@ -11,7 +13,7 @@ const router = express.Router();
 
 // Auth Routes
 router.post('/createuser',
-  //  captchaMiddleware,
+   captchaMiddleware,
   [
     body('name').isLength({ min: 3 }),
     body('username').isLength({ min: 3 }).custom(value => !/\s/.test(value)),
@@ -22,7 +24,7 @@ router.post('/createuser',
 
 
 router.post('/login',
-  //  captchaMiddleware,
+   captchaMiddleware,
   [
     body('identifier').notEmpty(),
     body('password').exists()
