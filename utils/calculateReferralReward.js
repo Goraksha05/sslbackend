@@ -1,25 +1,29 @@
-const rewardSlabs = require('../config/referralRewards.json');
+/**
+ * utils/tierCalculation/calculateReferralReward.js
+ *
+ * Thin wrapper that delegates to RewardEngine internals + rewardManager.
+ * Kept for backward compatibility with any callers that import this directly
+ * (undoRewardRedemption.js, simulationEngine.js, financeAndPayoutController.js).
+ *
+ * IMPORTANT: New code should use RewardEngine.claimReferralReward() instead.
+ */
 
-function calculateReferralReward(referralCount) {
-  const matched = rewardSlabs.slice().reverse().find(slab => referralCount >= slab.referralCount);
-  return matched || { groceryCoupons: 0, shares: 0, referralToken: 0 };
-}
+'use strict';
 
-function getReferralSlabProgress(referralCount) {
-  const sorted = [...rewardSlabs].sort((a, b) => a.referralCount - b.referralCount);
-  let reached = null, next = null;
-  for (let i = 0; i < sorted.length; i++) {
-    if (referralCount >= sorted[i].referralCount) {
-      reached = sorted[i];
-    } else {
-      next = sorted[i];
-      break;
-    }
+const { readRewards } = require('./rewardManager');
+
+/**
+ * @param {number} referralCount
+ * @param {string} [plan='2500']
+ * @returns {{ groceryCoupons, shares, referralToken } | null}
+ */
+function calculateReferralReward(referralCount, plan = '2500') {
+  try {
+    const slabs = readRewards('referral', String(plan));
+    return slabs.find(s => s.referralCount === referralCount) || null;
+  } catch {
+    return null;
   }
-  return { reached, next };
 }
 
-module.exports = {
-  calculateReferralReward,
-  getReferralSlabProgress
-};
+module.exports = { calculateReferralReward };

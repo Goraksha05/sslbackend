@@ -35,6 +35,8 @@ const {
   getKYCDetail,
   approveKYC,
   rejectKYC,
+  resetKYC,
+  getKYCStats,
   getMyKYC,
 } = require('../controllers/adminKycController');
 
@@ -92,16 +94,27 @@ router.get('/me', fetchuser, getMyKYC);
 
 // ── Admin routes ──────────────────────────────────────────────────────────────
 
+// GET /api/kyc/stats
+// Aggregate counts per KYC status — used by AdminKycDashboard stats cards.
+// MUST be declared before /:id so Express doesn't treat "stats" as an id.
+router.get('/stats', fetchuser, isAdmin, getKYCStats);
+
 // GET /api/kyc?status=submitted&search=foo&page=1&limit=30
 router.get('/', fetchuser, isAdmin, getKYCUsers);
 
 // GET /api/kyc/:id
 router.get('/:id', fetchuser, isAdmin, getKYCDetail);
 
-// PATCH /api/kyc/:id/approve
+// PATCH /api/kyc/:id/approve  (canonical name)
 router.patch('/:id/approve', fetchuser, isAdmin, approveKYC);
+
+// PATCH /api/kyc/:id/verify   (alias — AdminKycDashboard calls this name)
+router.patch('/:id/verify', fetchuser, isAdmin, approveKYC);
 
 // PATCH /api/kyc/:id/reject  — body: { reason: "..." }
 router.patch('/:id/reject', fetchuser, isAdmin, rejectKYC);
+
+// PATCH /api/kyc/:id/reset   — wipe record so user can resubmit from scratch
+router.patch('/:id/reset', fetchuser, isAdmin, resetKYC);
 
 module.exports = router;

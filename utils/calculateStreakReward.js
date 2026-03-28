@@ -1,25 +1,25 @@
-const rewardSlabs = require('../config/streakRewards.json');
+/**
+ * utils/tierCalculation/calculateStreakReward.js
+ *
+ * Backward-compatible wrapper. New code should use RewardEngine.claimStreakReward().
+ */
 
-function calculateStreakReward(dailystreak) {
-  const matched = rewardSlabs.find(item => item.streakslab === dailystreak);
-  return matched || { groceryCoupons: 0, shares: 0, referralToken: 0 };
-}
+'use strict';
 
-function getStreakSlabProgress(streakCount) {
-  const sorted = [...rewardSlabs].sort((a, b) => a.streakslab - b.streakslab);
-  let reached = null, next = null;
-  for (let i = 0; i < sorted.length; i++) {
-    if (streakCount >= sorted[i].streakslab) {
-      reached = sorted[i];
-    } else {
-      next = sorted[i];
-      break;
-    }
+const { readRewards } = require('./rewardManager');
+
+/**
+ * @param {number} daysRequired   Numeric days (30, 60, 90…)
+ * @param {string} [plan='2500']
+ * @returns {{ groceryCoupons, shares, referralToken } | null}
+ */
+function calculateStreakReward(daysRequired, plan = '2500') {
+  try {
+    const slabs = readRewards('streak', String(plan));
+    return slabs.find(s => s.dailystreak === daysRequired) || null;
+  } catch {
+    return null;
   }
-  return { reached, next };
 }
 
-module.exports = {
-  calculateStreakReward,
-  getStreakSlabProgress
-};
+module.exports = { calculateStreakReward };

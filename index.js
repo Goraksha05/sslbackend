@@ -248,11 +248,21 @@ app.use('/api/account', require('./routes/accountDeletion'));
 // Admin routes — protected at router level
 const fetchUserMw = require('./middleware/fetchuser')
 const isAdmin = require('./middleware/isAdmin');
+
+// Public admin auth routes (login / createadmin) — no JWT required
+app.use('/api/admin', require('./routes/admin'));
+
+// Protected admin sub-router — every route here needs a valid admin JWT
 const adminRouter = require('express').Router();
 adminRouter.use(fetchUserMw); // 1️⃣ decode JWT → sets req.user
 adminRouter.use(isAdmin); // Guard ALL admin sub-routes at the router level
 adminRouter.use(require('./routes/adminRewards'));
 adminRouter.use(require('./routes/adminRoutes'));
+// Post moderation: GET /api/admin/posts, PATCH .../moderation, DELETE, block-user
+adminRouter.use(require('./routes/adminPostModerationRoutes'));
+// Payout management: /api/admin/payouts/** — requires 'manage_payouts' permission
+adminRouter.use(require('./routes/payoutRoutes'));
+
 app.use('/api/admin', adminRouter);
 // User KYC routes:
 app.use('/api/kyc', require('./routes/adminKycRoutes'));

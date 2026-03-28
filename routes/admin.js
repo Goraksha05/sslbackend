@@ -1,9 +1,9 @@
 const express = require('express');
 const { body } = require('express-validator');
 const fetchUser = require('../middleware/fetchuser');
-const captchaMiddleware = require("../middleware/captcha");
+const captchaMiddleware = require("../middleware/captchaHybrid");
 const adminAuthController = require('../controllers/adminAuthController');
-const User = require('../models/User');
+
 
 const router = express.Router();
 
@@ -29,3 +29,5 @@ router.post('/adminlogin',
 
 // Get user info by ID
 router.get('/getloggeduser/:id', fetchUser, adminAuthController.getUserById);
+
+module.exports = router;

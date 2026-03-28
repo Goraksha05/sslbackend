@@ -55,17 +55,28 @@ router.get('/rewards', fetchUser, isAdmin, checkPermission('view_rewards'), asyn
 router.post('/admin/undo-reward', fetchUser, isAdmin, checkPermission('undo_rewards'), async (req, res) => {
   try {
     const { userId, type, slab } = req.body;
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    const success = await undoRedemption(user, type, slab);
-    if (!success) return res.status(400).json({ message: 'Nothing to undo or invalid slab type' });
-
+ 
+    if (!userId || !type || slab == null) {
+      return res.status(400).json({ message: 'userId, type, and slab are required.' });
+    }
+ 
+    const { undoReward, RewardEngineError } = require('../services/RewardEngine');
+ 
+    const success = await undoReward(userId, type, slab);
+ 
+    if (!success) {
+      return res.status(400).json({ message: 'Nothing to undo — slab not found in redeemed list.' });
+    }
+ 
     await writeAudit(req, 'reward_undo', { targetId: userId, type, slab });
-    return res.status(200).json({ message: 'Redemption undone successfully' });
+    return res.status(200).json({ message: 'Redemption undone successfully.' });
+ 
   } catch (err) {
+    if (err.name === 'RewardEngineError') {
+      return res.status(err.status || 400).json({ message: err.message, code: err.code });
+    }
     console.error('[POST /admin/undo-reward]', err);
-    res.status(500).json({ message: 'Failed to undo reward redemption' });
+    return res.status(500).json({ message: 'Failed to undo reward redemption.' });
   }
 });
 
@@ -172,5 +183,96 @@ router.get('/permissions', fetchUser, verifySuperAdmin, (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 
 router.get('/me', fetchUser, isAdmin, mgmt.getMe);
+
+// ════════════════════════════════════════════════════════════════════════════
+// FINANCIAL ANALYTICS  (used by AdminFinancial.js dashboard)
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/analytics
+router.get('/analytics', fetchUser, isAdmin, checkPermission('view_reports'), async (req, res) => {
+  try {
+    const now = new Date();
+
+    const [totalUsers, activeSubs, subPlans] = await Promise.all([
+      User.countDocuments(),
+      User.countDocuments({ 'subscription.active': true, 'subscription.expiresAt': { $gt: now } }),
+      User.aggregate([
+        { $match: { 'subscription.plan': { $exists: true, $ne: null } } },
+        { $group: { _id: '$subscription.plan', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ]),
+    ]);
+
+    return res.json({
+      totals: {
+        users:      totalUsers,
+        activeSubs,
+      },
+      subPlans, // [{ _id: 'Gold', count: 42 }, ...]
+    });
+  } catch (err) {
+    console.error('[GET /analytics]', err);
+    return res.status(500).json({ message: 'Failed to fetch analytics' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// FINANCIAL REPORT  (paginated user subscription + bank details)
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/reports/financial
+router.get('/reports/financial', fetchUser, isAdmin, checkPermission('view_reports'), async (req, res) => {
+  try {
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(100, parseInt(req.query.limit) || 25);
+    const skip  = (page - 1) * limit;
+
+    const filter = {};
+
+    if (req.query.plan)           filter['subscription.plan']   = req.query.plan;
+    if (req.query.hasBankDetails === 'true') {
+      filter['bankDetails.accountNumber'] = { $exists: true, $ne: null, $ne: '' };
+    }
+    if (req.query.from || req.query.to) {
+      filter['subscription.startDate'] = {};
+      if (req.query.from) filter['subscription.startDate'].$gte = new Date(req.query.from);
+      if (req.query.to)   filter['subscription.startDate'].$lte = new Date(req.query.to);
+    }
+
+    const formatDate = d => (d ? new Date(d).toLocaleDateString() : 'N/A');
+
+    const [users, total] = await Promise.all([
+      User.find(filter).select('-password').lean().skip(skip).limit(limit),
+      User.countDocuments(filter),
+    ]);
+
+    const report = users.map(u => ({
+      name:          u.name,
+      email:         u.email,
+      phone:         u.phone,
+      plan:          u.subscription?.plan   || 'None',
+      active:        u.subscription?.active ? 'Yes' : 'No',
+      startDate:     formatDate(u.subscription?.startDate),
+      expiresAt:     formatDate(u.subscription?.expiresAt),
+      paymentId:     u.subscription?.paymentId   || 'N/A',
+      accountNumber: u.bankDetails?.accountNumber || 'N/A',
+      ifscCode:      u.bankDetails?.ifscCode      || 'N/A',
+      panNumber:     u.bankDetails?.panNumber      || 'N/A',
+    }));
+
+    return res.json({
+      report,
+      pagination: {
+        page,
+        pages: Math.ceil(total / limit),
+        total,
+        limit,
+      },
+    });
+  } catch (err) {
+    console.error('[GET /reports/financial]', err);
+    return res.status(500).json({ message: 'Failed to fetch financial report' });
+  }
+});
 
 module.exports = router;

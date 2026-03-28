@@ -196,6 +196,33 @@ function getKycDecision(finalScore) {
 //    - If compressFile already produced a thumbnail (video, PDF), we prefer
 //      that over calling generateThumbnail again to avoid double processing.
 // ─────────────────────────────────────────────────────────────────────────────
+// ─── Path → public URL helper ──────────────────────────────────────────────
+// Converts an absolute disk path returned by compressFile / multer into a
+// root-relative URL that the Express static middleware serves under /uploads/.
+//
+// Example (Windows):
+//   "E:\sslapp\sslbackend\uploads\kyc\69bb_aadhaar_123.jpg"
+//   → "/uploads/kyc/69bb_aadhaar_123.jpg"
+//
+// Example (Linux):
+//   "/var/www/app/uploads/kyc/69bb_aadhaar_123.jpg"
+//   → "/uploads/kyc/69bb_aadhaar_123.jpg"
+//
+// If the path doesn't contain "/uploads/" (shouldn't happen but be safe),
+// returns the input unchanged so we never crash.
+function diskPathToPublicUrl(filePath) {
+  if (!filePath) return filePath;
+  // Already a URL (e.g. from generateThumbnail after the fix)
+  if (filePath.startsWith('/') || filePath.startsWith('http')) return filePath;
+  // Normalise Windows backslashes
+  const normalised = filePath.replace(/\\/g, '/');
+  const idx = normalised.indexOf('/uploads/');
+  if (idx !== -1) return normalised.slice(idx);
+  // Last resort — serve by filename only
+  const { path: nodePath } = require('path');
+  return `/uploads/${require('path').basename(filePath)}`;
+}
+
 async function processFile(file) {
   // Step 1 — compress
   const compressed = await compressFile(file.path, file.mimetype);
@@ -207,13 +234,19 @@ async function processFile(file) {
   // Step 2 — thumbnail
   // Prefer any thumbnail already produced by compressFile (video frames, PDF
   // previews). Only call generateThumbnail when compressFile produced none.
-  let thumbnailPath = compressed.thumbnails?.[0] || null;
+  //
+  // FIX: compressFile.thumbnails[0] is an absolute disk path — convert it.
+  // generateThumbnail (after the companion fix) already returns a public URL.
+  let thumbnailUrl = compressed.thumbnails?.[0]
+    ? diskPathToPublicUrl(compressed.thumbnails[0])
+    : null;
 
-  if (!thumbnailPath) {
+  if (!thumbnailUrl) {
     try {
       // generateThumbnail handles image/* and application/pdf; returns null
       // for unsupported types — that's fine, we just store null.
-      thumbnailPath = await generateThumbnail(filePath, mimeType);
+      // After the fix in generateThumbnail.js it returns a public URL directly.
+      thumbnailUrl = await generateThumbnail(filePath, mimeType);
     } catch (thumbErr) {
       // Non-fatal — KYC submission continues without a preview thumbnail
       console.warn(
@@ -224,9 +257,11 @@ async function processFile(file) {
   }
 
   return {
-    url:       filePath,
-    mimeType,            // surfaced so callers can store the post-compression type
-    thumbnail: thumbnailPath,
+    // FIX: store a public URL ("/uploads/kyc/..."), not the absolute disk path.
+    // The browser needs an HTTP URL, not a file:// path.
+    url:       diskPathToPublicUrl(filePath),
+    mimeType,
+    thumbnail: thumbnailUrl || null,
   };
 }
 
