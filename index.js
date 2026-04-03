@@ -81,10 +81,10 @@ app.use(
         defaultSrc: ["'self'"],
         imgSrc: ["'self'", 'data:', 'blob:',
           'https://res.cloudinary.com',
-          'http://localhost:5000', 'http://127.0.0.1:5000',
+          'http://localhost:5000', 'http://127.0.0.1:5000', 'http://192.168.1.2:5000', 'http://192.168.1.2:5001',
           'https://api.sosholife.com'],
         mediaSrc: ["'self'", 'blob:',
-          'http://localhost:5000', 'http://127.0.0.1:5000',
+          'http://localhost:5000', 'http://127.0.0.1:5000', 'http://192.168.1.2:5000', 'http://192.168.1.2:5001',
           'https://api.sosholife.com'],
         scriptSrc: ["'self'",
           'https://www.google.com',
@@ -96,7 +96,7 @@ app.use(
         connectSrc: ["'self'",
           'ws://localhost:5000', 'ws://127.0.0.1:5000',
           'wss://sosholife.com',
-          'http://localhost:5000', 'http://127.0.0.1:5000',
+          'http://localhost:5000', 'http://127.0.0.1:5000', 'http://192.168.1.2:5000', 'http://192.168.1.2:5001',
           'https://api.sosholife.com',
           'https://www.google.com'],
       },
@@ -115,8 +115,8 @@ const ALLOWED_ORIGINS = (process.env.FRONTEND_BASE_URL || '')
         'http://localhost:3001', 
         'http://127.0.0.1:3000', 
         'http://127.0.0.1:3001', 
-        'http://192.168.1.3:3000', 
-        'http://192.168.1.3:3001']
+        'http://192.168.1.2:3000', 
+        'http://192.168.1.2:3001']
       : []
   );
 
@@ -262,6 +262,7 @@ adminRouter.use(require('./routes/adminRoutes'));
 adminRouter.use(require('./routes/adminPostModerationRoutes'));
 // Payout management: /api/admin/payouts/** — requires 'manage_payouts' permission
 adminRouter.use(require('./routes/payoutRoutes'));
+adminRouter.use(require('./routes/adminActivityReportRoutes'));
 
 app.use('/api/admin', adminRouter);
 // User KYC routes:
@@ -288,6 +289,10 @@ cron.schedule('0 20 * * *', runVectorBuilderJob);    // 02:00 IST
 cron.schedule('30 21 * * *', runGraphAlgorithmsJob);  // 03:00 IST
 cron.schedule('30 22 * * *', runNightlyRescorer);     // 04:00 IST
 
+const { runCleanup } = require('./scripts/cleanupOrphanData');
+// Every Saturday at 04:30 IST (23:00 UTC Friday) — after the nightly jobs finish
+cron.schedule('0 23 * * 6', () => runCleanup({ dryRun: false, quiet: true }));
+
 
 // ── Global error handler ──────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars
@@ -313,7 +318,7 @@ app.use((err, req, res, next) => {
 });
 
 // ── Start Server ──────────────────────────────────────────────────────────────
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SoShoLife running on port ${PORT} [${process.env.NODE_ENV}]`);
 });
 
