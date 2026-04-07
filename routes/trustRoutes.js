@@ -50,32 +50,64 @@ function buildFpHash(signals) {
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
+// ── Signal type alias map ──────────────────────────────────────────────────────
+// Normalises common SDK shorthand names → the enum values in BehaviorSignal.js.
+// Add entries here when the frontend SDK uses a different name than the schema.
+const SIGNAL_TYPE_ALIASES = {
+  scroll:       'scroll_event',
+  click:        'click_event',
+  typing:       'typing_burst',
+  mouse:        'mouse_move',
+  nav:          'navigation',
+  navigate:     'navigation',
+  session_open: 'session_start',
+  session_close:'session_end',
+  post:         'post_created',
+  referral:     'referral_sent',
+  form:         'form_interaction',
+};
+
 // ── POST /api/trust/signal ─────────────────────────────────────────────────────
 // Browser SDK sends behavioral events. Authenticated user required.
-// Rate-limited server-side: max 60 signals/minute per user.
+// Always responds 202 so bots cannot fingerprint validation errors.
 router.post('/signal', fetchUser, async (req, res) => {
-  try {
-    const { signalType, payload, clientTimestamp, sessionId } = req.body;
+  // Always ack immediately — signal loss is acceptable, client must not retry on error
+  res.status(202).json({ ok: true });
 
-    if (!signalType || !payload) {
-      return res.status(400).json({ message: 'signalType and payload required' });
+  try {
+    const { signalType: rawType, payload, clientTimestamp, sessionId } = req.body;
+
+    // Silently drop malformed signals rather than returning 400
+    if (!rawType || payload === null || payload === undefined) return;
+
+    // Normalise alias → canonical enum value
+    const signalType = SIGNAL_TYPE_ALIASES[rawType] ?? rawType;
+
+    // Validate against the known enum before hitting Mongoose so we get a
+    // clear server-side log instead of a Mongoose ValidationError
+    const VALID_SIGNAL_TYPES = [
+      'typing_burst', 'mouse_move', 'scroll_event', 'click_event',
+      'session_start', 'session_end', 'navigation', 'post_created',
+      'referral_sent', 'form_interaction',
+    ];
+
+    if (!VALID_SIGNAL_TYPES.includes(signalType)) {
+      console.debug(`[trust/signal] Unknown signalType ignored: "${rawType}"`);
+      return;
     }
 
     await BehaviorSignal.create({
       userId:          req.user.id,
       signalType,
-      payload,
+      payload:         typeof payload === 'object' ? payload : { value: payload },
       clientTimestamp,
       sessionId,
       ip:              req.ip,
-      receivedAt:      new Date(),
+      receivedOn:      new Date(),   // FIX: schema field is `receivedOn`, not `receivedAt`
     });
-
-    res.status(202).json({ ok: true });
   } catch (err) {
-    // Non-fatal — signal loss is acceptable
+    // Non-fatal — log but never surface to client
     console.error('[trust/signal]', err.message);
-    res.status(202).json({ ok: true });  // Always 202 to not alert bots
   }
 });
 

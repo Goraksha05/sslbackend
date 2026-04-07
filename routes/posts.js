@@ -25,7 +25,7 @@ const moderateMedia = require('../utils/moderateMedia');
 const sanitizeHtml = require('sanitize-html');
 const mongoose = require('mongoose');
 const DEFAULT_LIMIT = 20;
-const MAX_LIMIT     = 50;
+const MAX_LIMIT = 50;
 
 const getBaseUrl = (req) => {
     return process.env.NODE_ENV === "production"
@@ -35,59 +35,59 @@ const getBaseUrl = (req) => {
 
 // Route 1: Get posts with cursor pagination
 router.get('/fetchallposts', fetchUser, async (req, res) => {
-  try {
-    // Parse pagination params
-    const limit  = Math.min(parseInt(req.query.limit ?? DEFAULT_LIMIT, 10), MAX_LIMIT);
-    const before = req.query.before; // ObjectId of the last post from previous page
+    try {
+        // Parse pagination params
+        const limit = Math.min(parseInt(req.query.limit ?? DEFAULT_LIMIT, 10), MAX_LIMIT);
+        const before = req.query.before; // ObjectId of the last post from previous page
 
-    // Build query
-    const query = {
-      $or: [{ visibility: 'public' }, { user_id: req.user.id }],
-    };
+        // Build query
+        const query = {
+            $or: [{ visibility: 'public' }, { user_id: req.user.id }],
+        };
 
-    // Cursor: only fetch posts older than the last seen
-    if (before && mongoose.Types.ObjectId.isValid(before)) {
-      query._id = { $lt: new mongoose.Types.ObjectId(before) };
+        // Cursor: only fetch posts older than the last seen
+        if (before && mongoose.Types.ObjectId.isValid(before)) {
+            query._id = { $lt: new mongoose.Types.ObjectId(before) };
+        }
+
+        // Use lean() for a plain JS object (much faster than full Mongoose hydration)
+        const posts = await PostSchema.find(query)
+            .populate('user_id', 'name subscription')
+            .sort({ _id: -1 }) // Use _id for stable cursor pagination
+            .limit(limit)
+            .lean();
+
+        // Batch-fetch profiles for all post authors
+        const userIds = [...new Set(posts.map((p) => p.user_id?._id?.toString()).filter(Boolean))];
+        const profiles = await Profile.find({ user_id: { $in: userIds } }).lean();
+        const profileMap = Object.fromEntries(profiles.map((p) => [p.user_id.toString(), p]));
+
+        // Merge avatar into post objects
+        const postsWithAvatars = posts.map((p) => {
+            const uid = p.user_id?._id?.toString();
+            const profile = uid ? profileMap[uid] : null;
+            return {
+                ...p,
+                profileavatar: profile?.profileavatar?.URL ?? null,
+            };
+        });
+
+        // Return cursor for the next page
+        const lastPost = posts[posts.length - 1];
+        const nextCursor = posts.length === limit ? lastPost?._id?.toString() : null;
+
+        res.json({
+            posts: postsWithAvatars,
+            pagination: {
+                limit,
+                nextCursor,         // Pass as `?before=nextCursor` in the next request
+                hasMore: !!nextCursor,
+            },
+        });
+    } catch (error) {
+        console.error('[posts] fetchallposts error:', error.message);
+        res.status(500).json({ message: 'Internal Server Error' });
     }
-
-    // Use lean() for a plain JS object (much faster than full Mongoose hydration)
-    const posts = await PostSchema.find(query)
-      .populate('user_id', 'name subscription')
-      .sort({ _id: -1 }) // Use _id for stable cursor pagination
-      .limit(limit)
-      .lean();
-
-    // Batch-fetch profiles for all post authors
-    const userIds  = [...new Set(posts.map((p) => p.user_id?._id?.toString()).filter(Boolean))];
-    const profiles = await Profile.find({ user_id: { $in: userIds } }).lean();
-    const profileMap = Object.fromEntries(profiles.map((p) => [p.user_id.toString(), p]));
-
-    // Merge avatar into post objects
-    const postsWithAvatars = posts.map((p) => {
-      const uid     = p.user_id?._id?.toString();
-      const profile = uid ? profileMap[uid] : null;
-      return {
-        ...p,
-        profileavatar: profile?.profileavatar?.URL ?? null,
-      };
-    });
-
-    // Return cursor for the next page
-    const lastPost   = posts[posts.length - 1];
-    const nextCursor = posts.length === limit ? lastPost?._id?.toString() : null;
-
-    res.json({
-      posts: postsWithAvatars,
-      pagination: {
-        limit,
-        nextCursor,         // Pass as `?before=nextCursor` in the next request
-        hasMore: !!nextCursor,
-      },
-    });
-  } catch (error) {
-    console.error('[posts] fetchallposts error:', error.message);
-    res.status(500).json({ message: 'Internal Server Error' });
-  }
 });
 
 //Route 2: Add Posts using: POST "/api/posts/addnewposts". Login required
@@ -134,11 +134,18 @@ router.post(
             });
 
             const savePost = await newpost.save();
+            const populatedPost = await savePost.populate('user_id', 'name subscription');
+
+            // Fetch the author's profile to get the avatar — same as fetchallposts does
+            const authorProfile = await Profile.findOne({ user_id: req.user.id }).lean();
+
+            const postObj = populatedPost.toObject();
+            postObj.profileavatar = authorProfile?.profileavatar?.URL ?? null;
 
             // Respond immediately so the client doesn't time out.
             res.json({
                 message: 'Post created',
-                post: savePost,
+                post: postObj,
             });
 
             // ── Background: compress + moderate (non-blocking, after response sent) ──

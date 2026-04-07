@@ -13,10 +13,8 @@ const MONGO_URI = process.env.MONGO_URI
 
 async function createDummyUser() {
   try {
-    await mongoose.connect(MONGO_URI, {
-      // useNewUrlParser: true,
-      // useUnifiedTopology: true,
-    });
+    await mongoose.connect(MONGO_URI);
+    console.log('Connected to MongoDB');
 
     const existingUser = await User.findOne({ email: 'dummy@example.com' });
     if (existingUser) {
