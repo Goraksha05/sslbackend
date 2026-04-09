@@ -13,6 +13,27 @@
  *  ✅ Health check includes DB connectivity
  *  ✅ Graceful shutdown on SIGTERM/SIGINT
  *
+ * FIX (416 Range Not Satisfiable on video):
+ *  ✅ compression() is now excluded from /uploads/* responses.
+ *     The compression middleware strips Accept-Ranges and interferes with
+ *     Content-Range/Content-Length when a browser video player sends a
+ *     Range: bytes=X-Y request. Express's static handler sets Content-Range
+ *     correctly, but compression then re-encodes the body and the declared
+ *     byte range no longer matches the actual body length → 416.
+ *     Fix: pass a `filter` function to compression() that skips any request
+ *     whose path starts with /uploads. Static media (video, image, audio)
+ *     must never be gzip/deflate-compressed — binary media is already
+ *     compressed and a second pass only wastes CPU and breaks range requests.
+ *  ✅ express.static now has explicit options:
+ *       acceptRanges: true   — required for video seek / partial content (HTTP 206)
+ *       lastModified: true   — enables conditional GET (304 Not Modified)
+ *       etag:         true   — cache validation without full re-download
+ *       maxAge:       '7d'   — browsers cache static assets; reduces repeat fetches
+ *       immutable:    false  — uploads can change (compressed replacement); don't
+ *                              tell browsers the URL is forever-immutable
+ *  ✅ /uploads route is registered BEFORE compression() so the static
+ *     middleware never sees the compression wrapper at all.
+ *
  * NOTE: express-async-errors is NOT used — it is incompatible with Express 5.
  * Express 5 natively catches rejected promises in route handlers and forwards
  * them to the error middleware automatically. No wrapper needed.
@@ -81,10 +102,10 @@ app.use(
         defaultSrc: ["'self'"],
         imgSrc: ["'self'", 'data:', 'blob:',
           'https://res.cloudinary.com',
-          'http://localhost:5000', 'http://127.0.0.1:5000', 'http://192.168.1.2:5000', 'http://192.168.1.2:5001',
+          'http://localhost:5000', 'http://127.0.0.1:5000',
           'https://api.sosholife.com'],
         mediaSrc: ["'self'", 'blob:',
-          'http://localhost:5000', 'http://127.0.0.1:5000', 'http://192.168.1.2:5000', 'http://192.168.1.2:5001',
+          'http://localhost:5000', 'http://127.0.0.1:5000',
           'https://api.sosholife.com'],
         scriptSrc: ["'self'",
           'https://www.google.com',
@@ -96,7 +117,7 @@ app.use(
         connectSrc: ["'self'",
           'ws://localhost:5000', 'ws://127.0.0.1:5000',
           'wss://sosholife.com',
-          'http://localhost:5000', 'http://127.0.0.1:5000', 'http://192.168.1.2:5000', 'http://192.168.1.2:5001',
+          'http://localhost:5000', 'http://127.0.0.1:5000',
           'https://api.sosholife.com',
           'https://www.google.com'],
       },
@@ -137,8 +158,42 @@ const corsOptions = {
 app.options('/{*path}', cors(corsOptions));
 app.use(cors(corsOptions));
 
-// ── Compression ───────────────────────────────────────────────────────────────
-app.use(compression());
+// ── Static uploads — registered BEFORE compression() ─────────────────────────
+app.use(
+  '/uploads',
+  express.static(path.join(__dirname, 'uploads'), {
+    acceptRanges: true,
+    lastModified:  true,
+    etag:          true,
+    maxAge:        '7d',
+    immutable:     false,
+    fallthrough:   true,
+  })
+);
+
+// ── Compression — applied AFTER /uploads so static media is never compressed ──
+// compression() filter contract: return true = compress, false = skip.
+const SKIP_COMPRESSION_RE = /^\/uploads\//;
+const COMPRESSIBLE_RE = /^(text|application)\/(javascript|json|html|xml|css|plain)/i;
+
+app.use(
+  compression({
+    filter: (req, res) => {
+      // Never compress /uploads responses (images, videos, audio, documents).
+      if (SKIP_COMPRESSION_RE.test(req.path)) return false;
+
+      // Use the standard compressible check for everything else.
+      // compression.filter is the default helper from the compression package.
+      const contentType = res.getHeader('Content-Type') || '';
+      if (!COMPRESSIBLE_RE.test(contentType)) return false;
+
+      return compression.filter(req, res);
+    },
+    // Compression level 6 is the default; level 1 is fastest with decent ratio.
+    // For an API server where most compressed responses are JSON, level 6 is fine.
+    level: 6,
+  })
+);
 
 // ── HTTP logging ──────────────────────────────────────────────────────────────
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
@@ -151,9 +206,6 @@ app.use(cookieParser());
 // File uploads use multer (separate limit); keep that at 100mb there.
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
-
-// ── Static uploads ────────────────────────────────────────────────────────────
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ── HTTPS redirect in production ──────────────────────────────────────────────
 if (process.env.NODE_ENV === 'production') {
@@ -262,7 +314,6 @@ adminRouter.use(require('./routes/adminRoutes'));
 adminRouter.use(require('./routes/adminPostModerationRoutes'));
 // Payout management: /api/admin/payouts/** — requires 'manage_payouts' permission
 adminRouter.use(require('./routes/payoutRoutes'));
-adminRouter.use(require('./routes/adminActivityReportRoutes'));
 
 app.use('/api/admin', adminRouter);
 // User KYC routes:
@@ -289,10 +340,6 @@ cron.schedule('0 20 * * *', runVectorBuilderJob);    // 02:00 IST
 cron.schedule('30 21 * * *', runGraphAlgorithmsJob);  // 03:00 IST
 cron.schedule('30 22 * * *', runNightlyRescorer);     // 04:00 IST
 
-const { runCleanup } = require('./scripts/cleanupOrphanData');
-// Every Saturday at 04:30 IST (23:00 UTC Friday) — after the nightly jobs finish
-cron.schedule('0 23 * * 6', () => runCleanup({ dryRun: false, quiet: true }));
-
 
 // ── Global error handler ──────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars
@@ -318,7 +365,7 @@ app.use((err, req, res, next) => {
 });
 
 // ── Start Server ──────────────────────────────────────────────────────────────
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, () => {
   console.log(`🚀 SoShoLife running on port ${PORT} [${process.env.NODE_ENV}]`);
 });
 
