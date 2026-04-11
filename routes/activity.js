@@ -326,4 +326,67 @@ router.get('/reward-eligibility', fetchUser, async (req, res) => {
   }
 });
 
+//==============================================================================
+//  ------------------ GET /api/activity/dashboard ----─────────────────────────
+//==============================================================================
+router.get('/dashboard', fetchUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+ 
+    // Run all three DB queries in parallel — no sequential waterfall.
+    const [streakDocs, referredUsers] = await Promise.all([
+      // 1. All streak activity entries for this user
+      Activity.find(
+        { user: userId, dailystreak: { $exists: true, $ne: null } },
+        'createdAt'
+      ).lean(),
+ 
+      // 2. All users referred by this user
+      User.find({ referral: userId })
+        .select('name email username subscription.active subscription.plan')
+        .lean(),
+    ]);
+ 
+    // ── Streak: count unique IST calendar days ─────────────────────────────
+    // We reduce to a Map<dateString, count> so duplicate log entries on the
+    // same day are collapsed into a single date (IST-aware).
+    const dateMap = new Map();
+    for (const doc of streakDocs) {
+      const d = new Date(doc.createdAt);
+      if (isNaN(d.getTime())) continue;
+ 
+      // Convert to IST (UTC+5:30) date string using Intl — no manual offset.
+      const key = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+      }).format(d);
+ 
+      dateMap.set(key, (dateMap.get(key) ?? 0) + 1);
+    }
+ 
+    const streakDates = Array.from(dateMap.entries()).map(([date, count]) => ({
+      date,
+      count,
+    }));
+    const streakCount = dateMap.size; // unique days
+ 
+    // ── Referrals ──────────────────────────────────────────────────────────
+    const referralCount       = referredUsers.length;
+    const activeReferralCount = referredUsers.filter(
+      (u) => u.subscription?.active
+    ).length;
+ 
+    return res.json({
+      streakCount,
+      streakDates,
+      referralCount,
+      activeReferralCount,
+      referredUsers,
+    });
+  } catch (err) {
+    console.error('[GET /activity/dashboard]', err);
+    return res.status(500).json({ message: 'Failed to load dashboard data.' });
+  }
+});
+ 
 module.exports = router;

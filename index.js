@@ -365,7 +365,7 @@ app.use((err, req, res, next) => {
 });
 
 // ── Start Server ──────────────────────────────────────────────────────────────
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SoShoLife running on port ${PORT} [${process.env.NODE_ENV}]`);
 });
 
