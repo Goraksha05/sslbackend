@@ -524,7 +524,7 @@ const verifyToken = fetchUser; // your auth middleware
 
 router.get('/my-count', verifyToken, async (req, res) => {
 try {
-    const count = await Post.countDocuments({ user_id: req.user.id });
+    const count = await PostSchema.countDocuments({ user_id: req.user.id });
     res.json({ count });
 } catch (err) {
     res.status(500).json({ message: 'Failed to get post count' });

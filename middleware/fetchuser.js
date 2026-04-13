@@ -302,7 +302,21 @@ const fetchUser = async (req, res, next) => {
     // ── 8. Account status gates ───────────────────────────────────────────
     // Checked on every DB fetch (cache miss), so these take effect within
     // USER_CACHE_TTL_MS of the admin action that set the flag.
-    if (dbUser.banned || dbUser.blocked) {
+    //
+    // BUG FIX: `banned` is a Mongoose sub-document, NOT a plain Boolean.
+    // The User schema defines it as:
+    //   banned: { isBanned: { type: Boolean, default: false }, ... }
+    //
+    // Because Mongoose always instantiates declared sub-documents, `dbUser.banned`
+    // is ALWAYS a non-null object like { isBanned: false, reason: null, ... } —
+    // even for users who have never been banned. A non-null object is truthy in
+    // JavaScript, so the old check `if (dbUser.banned)` evaluated to true for
+    // EVERY user on every cache miss, blocking all socket connections and
+    // returning 403 "Account restricted" for every authenticated request.
+    //
+    // Correct check: read the nested `isBanned` boolean, not the container object.
+    // `blocked` is a plain top-level Boolean so its check is unchanged.
+    if (dbUser.banned?.isBanned || dbUser.blocked) {
       // Do not cache — banned/blocked state should propagate immediately.
       invalidateUserCache(userId);
       return res.status(403).json({

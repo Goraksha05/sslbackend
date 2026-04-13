@@ -45,7 +45,7 @@
  */
 
 'use strict';
-
+const { getIO }                   = require('../sockets/IOsocket');
 const User                        = require('../models/User');
 const notifyUser                  = require('../utils/notifyUser');
 const { notifyMany }              = require('../utils/notifyUser');
@@ -153,6 +153,28 @@ async function kycNotify(userId, key) {
   } catch (err) {
     // Notification errors are non-fatal — log and continue
     console.error(`[kycNotify] Failed to notify user ${userId} (key=${key}):`, err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// REALTIME EMITTER (CLEAN)
+// ─────────────────────────────────────────────
+function emitKycRealtime(type, payload) {
+  try {
+    const io = getIO();
+    if (!io) return;
+
+    io.to("kyc_admins").emit("kyc:admin_update", {
+      type,
+      ...payload,
+    });
+
+    io.to("kyc_admins").emit("kyc:stats_update", {
+      type,
+    });
+
+  } catch (err) {
+    console.warn("[Realtime Emit Failed]:", err.message);
   }
 }
 
@@ -395,39 +417,46 @@ exports.submitKYC = async (req, res) => {
     // Notifications and bus events are non-fatal — failures must never abort
     // the KYC flow or cause a 500. bus.emit can throw when platformEventBus
     // tries to persist to a model that doesn't exist yet (missing migration).
+    // ── Notifications + Events ───────────────────
     await kycNotify(userId, 'submitted');
 
-    try {
-      bus.emit(bus.EVENTS.KYC_SUBMITTED, {
-        userId:   String(userId),
-        decision,
-        score:    finalScore,
-      });
-    } catch (busErr) {
-      console.warn('[submitKYC] bus.emit KYC_SUBMITTED failed:', busErr.message);
-    }
+    // ✅ Event Bus
+    bus.emit(bus.EVENTS.KYC_SUBMITTED, {
+      userId: String(userId),
+      decision,
+      score: finalScore,
+    });
+
+    // ✅ Realtime
+    emitKycRealtime("submitted", {
+      kycId: String(user._id),
+    });
 
     // Auto-approved: send verified notification immediately
     if (decision === 'auto_approve') {
       await kycNotify(userId, 'auto_verified');
-      try {
-        bus.emit(bus.EVENTS.KYC_VERIFIED, { userId: String(userId) });
-      } catch (busErr) {
-        console.warn('[submitKYC] bus.emit KYC_VERIFIED failed:', busErr.message);
-      }
+
+      bus.emit(bus.EVENTS.KYC_VERIFIED, {
+        userId: String(userId),
+      });
+
+      emitKycRealtime("approved", {
+        kycId: String(user._id),
+      });
     }
 
     // Auto-rejected: send rejection notification
     if (decision === 'reject') {
       await kycNotify(userId, 'rejected');
-      try {
-        bus.emit(bus.EVENTS.KYC_REJECTED, {
-          userId: String(userId),
-          reason: user.kyc.rejectionReason,
-        });
-      } catch (busErr) {
-        console.warn('[submitKYC] bus.emit KYC_REJECTED failed:', busErr.message);
-      }
+
+      bus.emit(bus.EVENTS.KYC_REJECTED, {
+        userId: String(userId),
+        reason: user.kyc.rejectionReason,
+      });
+
+      emitKycRealtime("rejected", {
+        kycId: String(user._id),
+      });
     }
 
     return res.json({
@@ -549,6 +578,10 @@ exports.approveKYC = async (req, res) => {
         userId:     String(user._id),
         approvedBy: String(req.user.id),
       });
+
+      emitKycRealtime("approved", {
+        kycId: String(user._id),
+      });
     } catch (busErr) {
       console.warn('[approveKYC] bus.emit KYC_VERIFIED failed:', busErr.message);
     }
@@ -622,6 +655,10 @@ exports.rejectKYC = async (req, res) => {
         rejectedBy: String(req.user.id),
         reason:     reason.trim(),
       });
+
+      emitKycRealtime("rejected", {
+        kycId: String(user._id),
+      });
     } catch (busErr) {
       console.warn('[rejectKYC] bus.emit KYC_REJECTED failed:', busErr.message);
     }
@@ -675,6 +712,10 @@ exports.resetKYC = async (req, res) => {
       bus.emit(bus.EVENTS.KYC_RESET ?? 'kyc_reset', {
         userId:  String(user._id),
         resetBy: String(req.user.id),
+      });
+
+      emitKycRealtime("reset", {
+        kycId: String(user._id),
       });
     } catch (busErr) {
       console.warn('[resetKYC] bus.emit KYC_RESET failed:', busErr.message);

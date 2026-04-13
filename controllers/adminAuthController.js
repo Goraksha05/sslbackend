@@ -29,10 +29,10 @@ exports.createAdmin = async (req, res) => {
     return res.status(400).json({ success: false, errors: errors.array() });
   }
 
-  const { name, username, email, phone, password } = req.body;
+  const { name, username, email, phone, password, role } = req.body;
 
-  // Normalize role
-  const userRole = role === 'admin' ? 'admin' : 'admin'; // Default to 'admin' if role is missing or invalid
+  // Normalize role — only 'admin' and 'super_admin' are valid; default to 'admin'.
+  const userRole = role === 'super_admin' ? 'super_admin' : 'admin';
 
   if (!name || !username || !email || !phone || !password) {
     return res.status(400).json({

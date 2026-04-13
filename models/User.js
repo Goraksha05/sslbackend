@@ -1,21 +1,31 @@
 // models/User.js
 //
-// FIX: The kyc sub-document was missing two fields that adminKycController.js
-// writes unconditionally:
+// CHANGES FROM PREVIOUS VERSION:
 //
-//   kyc.thumbnails   — { aadhaarThumb, panThumb, bankThumb, selfieThumb }
-//                      Written by processFile() in submitKYC. Without this
-//                      declared, Mongoose stores it as untyped Mixed data with
-//                      no path-level validation, and IDE/TypeScript tooling
-//                      cannot see it.
+//   1. NEW — `banned` sub-document added.
+//      The ban/unban endpoints in adminRoutes.js write to `user.banned`.
+//      Without this declaration Mongoose stores it as unvalidated Mixed data
+//      and the `user.banned?.isBanned` guard in the ban endpoint cannot
+//      distinguish between a never-set field (undefined) and an active ban
+//      (isBanned: true).
 //
-//   kyc.documents.selfie — The schema declared aadhaarFile, panFile,
-//                      bankPassbookFile but not selfie, even though submitKYC
-//                      stores selfieFile.url there.
+//      Shape:
+//        banned.isBanned   {Boolean}   true while the ban is active
+//        banned.reason     {String}    optional reason (max 500 chars)
+//        banned.bannedAt   {Date}      timestamp of the ban
+//        banned.bannedBy   {ObjectId}  admin who issued the ban
+//        banned.unbannedAt {Date}      timestamp of the last lift (null if still active)
+//        banned.unbannedBy {ObjectId}  admin who lifted the ban
 //
-// Both fields are now explicitly declared. Existing documents are unaffected —
-// Mongoose reads Mixed fields normally; the new declarations just add validation
-// and type coercion going forward.
+//      Defaults: isBanned: false so existing documents are immediately
+//      compatible — no migration script needed.
+//
+//   2. NOTE — `ban_users` permission token.
+//      This schema change does NOT require a new permission constant here,
+//      but add 'ban_users' to constants/permissions.js:
+//        PERMISSIONS.BAN_USERS = 'ban_users';
+//      and include it in any ROLE_PRESETS where you want regular admins to ban.
+//      super_admins always have it via the wildcard '*'.
 
 'use strict';
 
@@ -71,7 +81,7 @@ const UserSchema = new Schema({
 
   subscription: {
     plan:             { type: String },
-    planAmount:       { type: Number },   // numeric plan key (2500 / 3500 / 4500)
+    planAmount:       { type: Number },
     paymentId:        { type: String },
     orderId:          { type: String },
     active:           { type: Boolean, default: false },
@@ -102,7 +112,7 @@ const UserSchema = new Schema({
   redeemedStreakSlabs:     { type: [String], default: [] },
 
   termsAccepted: { type: Boolean, default: false },
-  isAdmin:       { type: Boolean, default: false },   // legacy — derived from role
+  isAdmin:       { type: Boolean, default: false },
 
   lastActive: { type: Date, default: Date.now },
 
@@ -110,6 +120,30 @@ const UserSchema = new Schema({
     requested:   { type: Boolean, default: false },
     requestedAt: { type: Date,    default: null   },
     scheduledAt: { type: Date,    default: null   },
+  },
+
+  // ── Platform Ban ──────────────────────────────────────────────────────────
+  // Written by POST /api/admin/ban-user/:id and POST /api/admin/unban-user/:id.
+  // Only admins with the 'ban_users' permission (or super_admin) may write here.
+  banned: {
+    isBanned: {
+      type:    Boolean,
+      default: false,
+      index:   true,    // indexed so banned-user queries are fast
+    },
+    reason:     { type: String,                         default: null },
+    bannedAt:   { type: Date,                           default: null },
+    bannedBy: {
+      type:     mongoose.Schema.Types.ObjectId,
+      ref:      'user',
+      default:  null,
+    },
+    unbannedAt: { type: Date,                           default: null },
+    unbannedBy: {
+      type:     mongoose.Schema.Types.ObjectId,
+      ref:      'user',
+      default:  null,
+    },
   },
 
   // ── eKYC ──────────────────────────────────────────────────────────────────
@@ -124,12 +158,9 @@ const UserSchema = new Schema({
       aadhaarFile:      String,
       panFile:          String,
       bankPassbookFile: String,
-      // FIX: selfie was written by submitKYC but not declared in the schema
       selfie:           String,
     },
 
-    // FIX: thumbnails sub-document was written by processFile() / submitKYC
-    // but not declared in the schema, so it was stored as unvalidated Mixed data.
     thumbnails: {
       aadhaarThumb: { type: String, default: null },
       panThumb:     { type: String, default: null },
@@ -192,7 +223,7 @@ const UserSchema = new Schema({
 function getInitials(name) {
   const words = String(name || '').trim().split(/\s+/).filter(Boolean);
   let initials = '';
-  if (words.length >= 2)      initials = (words[0][0] || '') + (words[1][0] || '');
+  if (words.length >= 2)       initials = (words[0][0] || '') + (words[1][0] || '');
   else if (words.length === 1) initials = (words[0][0] || '') + (words[0][1] || '');
   else                         initials = 'UU';
   return initials.toUpperCase().replace(/[^A-Z]/g, 'X').padEnd(2, 'X').slice(0, 2);

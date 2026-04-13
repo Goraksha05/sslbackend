@@ -1,12 +1,18 @@
 // routes/adminRoutes.js
-// All original endpoints kept intact; each carries the appropriate
-// checkPermission() guard alongside the existing fetchUser + isAdmin chain.
-// Admin-management, role-management and audit-log endpoints wired.
+// All original endpoints kept intact.
 //
 // ── NEW in this version ──────────────────────────────────────────────────────
-//   POST /create-admin  — super_admin creates a brand-new admin account
-//                         (replaces the old /register dual-mode approach).
-//                         Called by AdminCreateUser.js (post-login only).
+//   POST /api/admin/ban-user/:id    — ban a user (super_admin or admin with ban_users)
+//   POST /api/admin/unban-user/:id  — lift a ban  (same permission requirement)
+//
+// Permission model:
+//   • super_admin       — always allowed (wildcard '*' from fetchUser middleware)
+//   • admin with role   — allowed only if 'ban_users' is in their permissions[]
+//   • admin without it  — 403 Forbidden
+//
+// The checkPermission('ban_users') middleware enforces this; verifySuperAdmin
+// is NOT used because regular admins whose role includes 'ban_users' must also
+// be able to call these endpoints.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express    = require('express');
@@ -24,7 +30,7 @@ const mgmt       = require('../controllers/adminManagementController');
 const isAdmin = verifyAdmin;
 
 // ════════════════════════════════════════════════════════════════════════════
-// EXISTING ROUTES (unchanged behaviour, permission guard added)
+// EXISTING ROUTES (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 
 // GET /api/admin/users
@@ -55,22 +61,22 @@ router.get('/rewards', fetchUser, isAdmin, checkPermission('view_rewards'), asyn
 router.post('/admin/undo-reward', fetchUser, isAdmin, checkPermission('undo_rewards'), async (req, res) => {
   try {
     const { userId, type, slab } = req.body;
- 
+
     if (!userId || !type || slab == null) {
       return res.status(400).json({ message: 'userId, type, and slab are required.' });
     }
- 
-    const { undoReward, RewardEngineError } = require('../services/RewardEngine');
- 
+
+    const { undoReward } = require('../services/RewardEngine');
+
     const success = await undoReward(userId, type, slab);
- 
+
     if (!success) {
       return res.status(400).json({ message: 'Nothing to undo — slab not found in redeemed list.' });
     }
- 
+
     await writeAudit(req, 'reward_undo', { targetId: userId, type, slab });
     return res.status(200).json({ message: 'Redemption undone successfully.' });
- 
+
   } catch (err) {
     if (err.name === 'RewardEngineError') {
       return res.status(err.status || 400).json({ message: err.message, code: err.code });
@@ -90,6 +96,7 @@ router.get('/user-report', fetchUser, isAdmin, checkPermission('view_reports'), 
       return isNaN(d.getTime()) ? 'N/A' : d.toLocaleDateString();
     };
     const report = users.map(user => ({
+      _id:                   user._id,
       name:                  user.name,
       email:                 user.email,
       phone:                 user.phone,
@@ -104,6 +111,8 @@ router.get('/user-report', fetchUser, isAdmin, checkPermission('view_reports'), 
       redeemedPostSlabs:     user.redeemedPostSlabs?.length || 0,
       redeemedReferralSlabs: user.redeemedReferralSlabs?.length || 0,
       redeemedStreakSlabs:   user.redeemedStreakSlabs?.length || 0,
+      // Include ban status so the frontend can render the correct button state
+      banned:                !!(user.banned?.isBanned),
     }));
     res.status(200).json({ success: true, report });
   } catch (err) {
@@ -115,7 +124,18 @@ router.get('/user-report', fetchUser, isAdmin, checkPermission('view_reports'), 
 // GET /api/admin/reward-claims
 router.get('/reward-claims', fetchUser, isAdmin, checkPermission('approve_reward_claims'), async (req, res) => {
   try {
-    const claims = await RewardClaim.find().populate('user', 'name email').sort({ claimedAt: -1 });
+    // FIX: RewardClaim schema declares ref: 'User' (capital U) but User.js
+    // registers the model as mongoose.model('user', ...) (lowercase).
+    // Mongoose's populate() looks up the registered model by the ref string
+    // and throws "Schema hasn't been registered for model 'User'" when the
+    // casing doesn't match.
+    //
+    // Using the { model, select } object form of populate() overrides the ref
+    // and explicitly passes the already-loaded User constructor, so the casing
+    // in the RewardClaim schema is irrelevant.
+    const claims = await RewardClaim.find()
+      .populate({ path: 'user', model: User, select: 'name email' })
+      .sort({ claimedAt: -1 });
     res.json(claims);
   } catch (err) {
     console.error('Reward claim fetch error:', err.message);
@@ -126,21 +146,6 @@ router.get('/reward-claims', fetchUser, isAdmin, checkPermission('approve_reward
 // ════════════════════════════════════════════════════════════════════════════
 // NEW: CREATE ADMIN ACCOUNT  (super_admin only)
 // ════════════════════════════════════════════════════════════════════════════
-//
-// POST /api/admin/create-admin
-//
-// Called by: AdminCreateUser.js (pages/AdminCreateUser.js) — only after
-// super_admin is logged in and navigates to /admin/create-admin.
-//
-// Body: { name, username, email, phone, password, roleId, permissions? }
-//
-// What makes this different from POST /api/auth/createuser:
-//   ✅ No referral code required — internal accounts are exempt
-//   ✅ No OTP verification       — super_admin is trusted
-//   ✅ Sets role:'admin', isAdmin:true, adminRole immediately
-//   ✅ Optional per-permission override via `permissions[]`
-//   ✅ Does NOT log the new admin in — they log in separately
-//   ✅ Writes an audit log entry
 
 router.post('/create-admin', fetchUser, verifySuperAdmin, mgmt.createAdmin);
 
@@ -169,7 +174,7 @@ router.delete('/roles/:id', fetchUser, verifySuperAdmin, mgmt.deleteRole);
 router.get('/audit-logs', fetchUser, isAdmin, checkPermission('view_audit_logs'), mgmt.getAuditLogs);
 
 // ════════════════════════════════════════════════════════════════════════════
-// PERMISSIONS CATALOGUE  (so frontend can build role-creation UI)
+// PERMISSIONS CATALOGUE
 // ════════════════════════════════════════════════════════════════════════════
 
 const { PERMISSIONS, ROLE_PRESETS } = require('../constants/permissions');
@@ -179,20 +184,18 @@ router.get('/permissions', fetchUser, verifySuperAdmin, (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// CURRENT ADMIN PROFILE  (any admin can call this)
+// CURRENT ADMIN PROFILE
 // ════════════════════════════════════════════════════════════════════════════
 
 router.get('/me', fetchUser, isAdmin, mgmt.getMe);
 
 // ════════════════════════════════════════════════════════════════════════════
-// FINANCIAL ANALYTICS  (used by AdminFinancial.js dashboard)
+// FINANCIAL ANALYTICS
 // ════════════════════════════════════════════════════════════════════════════
 
-// GET /api/admin/analytics
 router.get('/analytics', fetchUser, isAdmin, checkPermission('view_reports'), async (req, res) => {
   try {
     const now = new Date();
-
     const [totalUsers, activeSubs, subPlans] = await Promise.all([
       User.countDocuments(),
       User.countDocuments({ 'subscription.active': true, 'subscription.expiresAt': { $gt: now } }),
@@ -202,14 +205,7 @@ router.get('/analytics', fetchUser, isAdmin, checkPermission('view_reports'), as
         { $sort: { count: -1 } },
       ]),
     ]);
-
-    return res.json({
-      totals: {
-        users:      totalUsers,
-        activeSubs,
-      },
-      subPlans, // [{ _id: 'Gold', count: 42 }, ...]
-    });
+    return res.json({ totals: { users: totalUsers, activeSubs }, subPlans });
   } catch (err) {
     console.error('[GET /analytics]', err);
     return res.status(500).json({ message: 'Failed to fetch analytics' });
@@ -217,10 +213,9 @@ router.get('/analytics', fetchUser, isAdmin, checkPermission('view_reports'), as
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// FINANCIAL REPORT  (paginated user subscription + bank details)
+// FINANCIAL REPORT
 // ════════════════════════════════════════════════════════════════════════════
 
-// GET /api/admin/reports/financial
 router.get('/reports/financial', fetchUser, isAdmin, checkPermission('view_reports'), async (req, res) => {
   try {
     const page  = Math.max(1, parseInt(req.query.page)  || 1);
@@ -228,10 +223,9 @@ router.get('/reports/financial', fetchUser, isAdmin, checkPermission('view_repor
     const skip  = (page - 1) * limit;
 
     const filter = {};
-
-    if (req.query.plan)           filter['subscription.plan']   = req.query.plan;
+    if (req.query.plan) filter['subscription.plan'] = req.query.plan;
     if (req.query.hasBankDetails === 'true') {
-      filter['bankDetails.accountNumber'] = { $exists: true, $ne: null, $ne: '' };
+      filter['bankDetails.accountNumber'] = { $exists: true, $ne: null };
     }
     if (req.query.from || req.query.to) {
       filter['subscription.startDate'] = {};
@@ -240,7 +234,6 @@ router.get('/reports/financial', fetchUser, isAdmin, checkPermission('view_repor
     }
 
     const formatDate = d => (d ? new Date(d).toLocaleDateString() : 'N/A');
-
     const [users, total] = await Promise.all([
       User.find(filter).select('-password').lean().skip(skip).limit(limit),
       User.countDocuments(filter),
@@ -257,22 +250,155 @@ router.get('/reports/financial', fetchUser, isAdmin, checkPermission('view_repor
       paymentId:     u.subscription?.paymentId   || 'N/A',
       accountNumber: u.bankDetails?.accountNumber || 'N/A',
       ifscCode:      u.bankDetails?.ifscCode      || 'N/A',
-      panNumber:     u.bankDetails?.panNumber      || 'N/A',
+      panNumber:     u.bankDetails?.panNumber     || 'N/A',
     }));
 
-    return res.json({
-      report,
-      pagination: {
-        page,
-        pages: Math.ceil(total / limit),
-        total,
-        limit,
-      },
-    });
+    return res.json({ report, pagination: { page, pages: Math.ceil(total / limit), total, limit } });
   } catch (err) {
     console.error('[GET /reports/financial]', err);
     return res.status(500).json({ message: 'Failed to fetch financial report' });
   }
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// USER BAN / UNBAN  ← NEW
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Permission: 'ban_users'
+//   • super_admin — always allowed (wildcard '*' granted by fetchUser middleware)
+//   • admin       — allowed only if their assigned AdminRole includes 'ban_users'
+//
+// Why checkPermission('ban_users') instead of verifySuperAdmin:
+//   verifySuperAdmin would lock these endpoints to super_admins only and
+//   prevent delegated admins whose role explicitly includes 'ban_users' from
+//   using the feature. checkPermission handles both cases correctly:
+//     isSuperAdmin → true  (via '*' wildcard in permissions[])
+//     permissions.includes('ban_users') → true for delegated admins
+//
+// Route order: /ban-user/:id must come BEFORE any wildcard that could
+// accidentally capture "ban-user" as a param (none here, but documented).
+//
+// POST /api/admin/ban-user/:id
+//   Body (optional): { reason: string }
+//   Response:        { message, user: { id, name, email, banned } }
+//
+router.post(
+  '/ban-user/:id',
+  fetchUser,
+  isAdmin,
+  checkPermission('ban_users'),
+  async (req, res) => {
+    const { id } = req.params;
+    const reason  = (req.body?.reason || '').trim().slice(0, 500) || null;
+
+    try {
+      const target = await User.findById(id);
+
+      if (!target) {
+        return res.status(404).json({ message: 'User not found.' });
+      }
+
+      // Prevent banning admins / super_admins through this endpoint
+      if (target.role === 'admin' || target.role === 'super_admin') {
+        return res.status(403).json({
+          message: 'Admin accounts cannot be banned through this endpoint. Use the admin management panel.',
+        });
+      }
+
+      // Prevent banning an already-banned user (idempotency)
+      if (target.banned?.isBanned) {
+        return res.status(409).json({ message: 'User is already banned.' });
+      }
+
+      // Write the ban sub-document
+      target.banned = {
+        isBanned:  true,
+        reason:    reason,
+        bannedAt:  new Date(),
+        bannedBy:  req.user.id,
+      };
+
+      await target.save();
+
+      // Audit trail
+      await writeAudit(req, 'user_ban', {
+        targetId:    target._id,
+        targetEmail: target.email,
+        reason,
+      });
+
+      return res.status(200).json({
+        message: `${target.name} (${target.email}) has been banned.`,
+        user: {
+          id:     target._id,
+          name:   target.name,
+          email:  target.email,
+          banned: true,
+        },
+      });
+    } catch (err) {
+      console.error('[POST /ban-user/:id]', err);
+      return res.status(500).json({ message: 'Failed to ban user.' });
+    }
+  }
+);
+
+//
+// POST /api/admin/unban-user/:id
+//   Response: { message, user: { id, name, email, banned } }
+//
+router.post(
+  '/unban-user/:id',
+  fetchUser,
+  isAdmin,
+  checkPermission('ban_users'),
+  async (req, res) => {
+    const { id } = req.params;
+
+    try {
+      const target = await User.findById(id);
+
+      if (!target) {
+        return res.status(404).json({ message: 'User not found.' });
+      }
+
+      // Idempotency: already unbanned
+      if (!target.banned?.isBanned) {
+        return res.status(409).json({ message: 'User is not currently banned.' });
+      }
+
+      // Clear the ban
+      target.banned = {
+        isBanned:    false,
+        reason:      null,
+        bannedAt:    null,
+        bannedBy:    null,
+        unbannedAt:  new Date(),
+        unbannedBy:  req.user.id,
+      };
+
+      await target.save();
+
+      // Audit trail
+      await writeAudit(req, 'user_unban', {
+        targetId:    target._id,
+        targetEmail: target.email,
+      });
+
+      return res.status(200).json({
+        message: `${target.name} (${target.email}) has been unbanned.`,
+        user: {
+          id:     target._id,
+          name:   target.name,
+          email:  target.email,
+          banned: false,
+        },
+      });
+    } catch (err) {
+      console.error('[POST /unban-user/:id]', err);
+      return res.status(500).json({ message: 'Failed to unban user.' });
+    }
+  }
+);
 
 module.exports = router;

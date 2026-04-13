@@ -72,7 +72,8 @@ const morgan = require('morgan');
 const cloudinary = require('cloudinary').v2;
 const cookieParser = require('cookie-parser');
 
-const { initializeSocket, getIO } = require('./sockets/IOsocket');
+const { initializeSocket } = require('./sockets/IOsocket');
+const { getIO } = require('./sockets/socketManager');
 const { authLimiter, otpLimiter, apiLimiter } = require('./middleware/rateLimiter');
 
 const PORT = process.env.PORT || 5000;
@@ -310,10 +311,10 @@ adminRouter.use(fetchUserMw); // 1️⃣ decode JWT → sets req.user
 adminRouter.use(isAdmin); // Guard ALL admin sub-routes at the router level
 adminRouter.use(require('./routes/adminRewards'));
 adminRouter.use(require('./routes/adminRoutes'));
-// Post moderation: GET /api/admin/posts, PATCH .../moderation, DELETE, block-user
 adminRouter.use(require('./routes/adminPostModerationRoutes'));
-// Payout management: /api/admin/payouts/** — requires 'manage_payouts' permission
 adminRouter.use(require('./routes/payoutRoutes'));
+adminRouter.use(require('./routes/adminActivityReportRoutes'));
+adminRouter.use(require('./routes/walletReportRoutes'));
 
 app.use('/api/admin', adminRouter);
 // User KYC routes:
