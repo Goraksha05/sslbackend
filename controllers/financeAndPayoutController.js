@@ -42,17 +42,17 @@
 
 'use strict';
 
-const mongoose    = require('mongoose');
-const User        = require('../models/User');
-const RewardClaim = require('../models/RewardClaim');
-const { writeAudit } = require('../middleware/rbac');
-const Payout = require('../models/PayoutSchema');
+const mongoose        = require('mongoose');
+const rn              = require('../services/rewardNotificationService');
+const User            = require('../models/User');
+const RewardClaim     = require('../models/RewardClaim');
+const { writeAudit }  = require('../middleware/rbac');
+const Payout          = require('../models/PayoutSchema');
 // Tier calculation utilities — the exact same functions activity.js uses when
 // the user originally claims a reward, so slab resolution is always consistent.
 const { calculatePostsReward }    = require('../utils/calculatePostsReward');
 const { calculateReferralReward } = require('../utils/calculateReferralReward');
 const { calculateStreakReward }   = require('../utils/calculateStreakReward');
-
 // ── INR conversion rates ───────────────────────────────────────────────────────
 // Adjust these two constants when valuations change — nothing else needs updating.
 const SHARE_INR_VALUE = 1;  // 1 share unit   = ₹1
@@ -619,6 +619,20 @@ exports.processPayout = async (req, res) => {
       processedAt: now,
       paidAt:      requestedStatus === 'paid' ? now : null,
     });
+    setImmediate(() => {
+      rn.notifyPayoutStatusChanged({
+        payoutId:   String(payout._id),
+        userId:     user._id,
+        userName:   user.name || user.username,
+        oldStatus:  'pending',
+        newStatus:  requestedStatus,
+        amountINR:  totalAmountINR,
+        rewardType: claim.type,
+        milestone:  String(claim.milestone),
+        adminName:  req.user.name || req.user.email || 'Admin',
+      }).catch(err => console.warn('[notify]', err.message));
+    });
+
 
     // ── 7. Audit log ───────────────────────────────────────────────────────────
     await writeAudit(req, 'payout_processed', {
@@ -736,6 +750,22 @@ exports.updatePayoutStatus = async (req, res) => {
     }
 
     await payout.save();
+
+    setImmediate(() => {
+      rn.notifyPayoutStatusChanged({
+        payoutId:       String(payout._id),
+        userId:         payout.user?._id ?? payout.user,
+        userName:       payout.user?.name || 'User',
+        oldStatus:      previousStatus,
+        newStatus,
+        amountINR:      payout.totalAmountINR,
+        rewardType:     payout.rewardType,
+        milestone:      String(payout.milestone),
+        transactionRef: transactionRef || null,
+        failureReason:  failureReason  || null,
+        adminName:      req.user.name  || req.user.email || 'Admin',
+      }).catch(err => console.warn('[notify]', err.message));
+    });
 
     await writeAudit(req, 'payout_status_updated', {
       payoutId:       payout._id,
@@ -887,6 +917,20 @@ exports.bulkProcessPayouts = async (req, res) => {
         status:         requestedStatus,
         userEmail:      claim.user.email,
       });
+
+      setImmediate(() => {
+        rn.notifyPayoutStatusChanged({
+          payoutId:   String(payout._id),
+          userId:     user._id,
+          userName:   user.name || user.username,
+          oldStatus:  'pending',
+          newStatus:  requestedStatus,
+          amountINR:  totalAmountINR,
+          rewardType: claim.type,
+          milestone:  String(claim.milestone),
+          adminName:  req.user.name || req.user.email || 'Admin',
+        }).catch(err => console.warn('[notify]', err.message));
+      });      
     } catch (err) {
       if (err.code === 11000) {
         // Unique index fired — a concurrent request created the payout between our
@@ -901,6 +945,17 @@ exports.bulkProcessPayouts = async (req, res) => {
 
   const totalINRDispatched = results.processed.reduce((s, p) => s + (p.totalAmountINR || 0), 0);
 
+  setImmediate(() => {
+  rn.notifyBulkPayoutComplete({
+      adminId:           req.user.id,
+      adminName:         req.user.name || req.user.email || 'Admin',
+      processed:         results.processed.length,
+      skipped:           results.skipped.length,
+      failed:            results.failed.length,
+      totalINRDispatched,
+    }).catch(err => console.warn('[notify]', err.message));
+  });
+  
   // Single audit entry for the entire batch
   await writeAudit(req, 'payout_bulk_processed', {
     processedCount:     results.processed.length,

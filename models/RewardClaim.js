@@ -25,7 +25,7 @@ const RewardClaimSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["referral", "post", "streak"],
+      enum: ["referral", "post", "streak", "grocery_redeem"],
       required: true
     },
     milestone: {

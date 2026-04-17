@@ -13,7 +13,7 @@ const {
 } = require("../middleware/upload");
 const Activity = require('../models/Activity');
 const User = require('../models/User');
-const calculatePostsReward = require('../utils/tierCalculation/calculatePostsReward');
+const calculatePostsReward = require('../utils/calculatePostsReward');
 const Profile = require('../models/Profile');
 const Comment = require('../models/Comment');
 const compressFile = require("../utils/compressFile");

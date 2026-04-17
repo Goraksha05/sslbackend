@@ -26,7 +26,7 @@ const mongoose = require('mongoose');
 const User        = require('../models/User');
 const Activity    = require('../models/Activity');
 const RewardClaim = require('../models/RewardClaim');
-
+const rn = require('./rewardNotificationService');
 const { readRewards }    = require('../utils/rewardManager');
 const { getUserPlan }    = require('../utils/getPlanKey');
 
@@ -177,6 +177,14 @@ async function claimReferralReward(userId, referralCount, bankDetails) {
       );
     }
     if (user.trustFlags?.rewardsFrozen) {
+      setImmediate(() =>
+        rn.notifyFrozenClaimAttempt({
+          userId:     user._id,
+          userName:   user.name || user.username,
+          rewardType: 'referral', // or 'post' / 'streak' depending on the method
+          milestone:  referralCount,
+        }).catch(() => {})
+      );
       throw new RewardEngineError(
         'Your reward payouts are temporarily suspended pending verification.',
         'REWARDS_FROZEN', 403
@@ -236,25 +244,51 @@ async function claimReferralReward(userId, referralCount, bankDetails) {
     // ── 8. Persist atomically ─────────────────────────────────────────────
     await user.save(sessionOpts);
 
-    await Promise.all([
-      new Activity({
-        user:        user._id,
-        referral:    user._id,
-        type:        'referral_reward',
-        slabAwarded: referralCount,
-      }).save(sessionOpts),
+    const activity = new Activity({
+      user: user._id,
+      referral: user._id,
+      type: 'referral_reward',
+      slabAwarded: referralCount,
+    });
+
+    const [savedActivity, rewardClaim] = await Promise.all([
+      activity.save(sessionOpts),
 
       RewardClaim.create(
-        [{ user: user._id, type: 'referral', milestone: String(referralCount) }],
+        [
+          {
+            user: user._id,
+            type: 'referral',
+            milestone: String(referralCount),
+          },
+        ],
         sessionOpts
       ),
     ]);
 
+    const claimId = rewardClaim?.[0]?._id || null;
+
+    // ── 10. Notification (non-blocking) ───────────────────────────────────
+    setImmediate(() => {
+      rn.notifyRewardClaimed({
+        userId: user._id,
+        userName: user.name || user.username,
+        rewardType: 'referral',
+        milestone: referralCount,
+        planKey,
+        amountINR: groceryCoupons + shares + referralToken,
+        claimId,
+      }).catch((err) =>
+        console.warn('[RewardEngine] notification failed:', err.message)
+      );
+    });
+
+    // ── 11. Return response ───────────────────────────────────────────────
     return {
       planKey,
       milestone: referralCount,
-      reward:    { groceryCoupons, shares, referralToken },
-      wallet:    walletSnapshot(user),
+      reward: { groceryCoupons, shares, referralToken },
+      wallet: walletSnapshot(user),
     };
   });
 }

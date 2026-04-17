@@ -289,11 +289,11 @@ app.use('/api', (req, res, next) => {
 app.use('/api/posts', require('./routes/posts'));
 app.use('/api/profile', require('./routes/profile'));
 app.use('/api/activity', require('./routes/activity'));
+app.use('/api/activity', require('./routes/redeemGrocery'));
 app.use('/api/friends', require('./routes/friends'));
 app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/payment', require('./routes/payment'));
 app.use('/api/rewards', require('./routes/userRewardSlabs'));
-
 // Account delete action routes:
 app.use('/api/account', require('./routes/accountDeletion'));
 
