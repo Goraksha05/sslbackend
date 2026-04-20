@@ -15,7 +15,7 @@
  *   await rn.notifyGroceryRedemptionSubmitted({ userId, userName, amountINR, payoutId });
  *
  *   // From bulkProcess (after batch completes):
- *   await rn.notifyBulkPayoutComplete({ adminId, processed, skipped, failed, totalINRDispatched });
+ *   await rn.notifyBulkPayoutComplete({ adminId, processed, skipped, failed, totalCashINRDispatched, totalObjectRewardsHeld, forcedToOnHoldCount });
  */
 
 'use strict';
@@ -220,7 +220,7 @@ async function notifyRewardClaimed({
   const milestoneStr = rewardType === 'streak' ? `${milestone} day streak` : `${milestone} ${rewardType}s`;
 
   // ── To user (confirmation) ────────────────────────────────────────────────
-  const userMsg = `${emoji} You claimed your ${typeStr} Reward for ${milestoneStr}! ${fmtINR(amountINR)} is being processed.`;
+  const userMsg = `${emoji} You claimed your ${typeStr} Reward for ${milestoneStr}! ${fmtINR(amountINR)} in grocery coupons is being processed as a cash payout.`;
   await dispatchToUser(
     userId,
     userMsg,
@@ -228,7 +228,7 @@ async function notifyRewardClaimed({
     `/rewards/${rewardType}`,
     {
       title:   `${emoji} Reward Claimed!`,
-      message: `${fmtINR(amountINR)} ${typeStr} reward for ${milestoneStr} is now in queue.`,
+      message: `${fmtINR(amountINR)} grocery coupon cash reward for ${milestoneStr} is now in queue.`,
       url:     `/rewards/${rewardType}`,
     },
     { rewardType, milestone, amountINR, planKey }
@@ -298,10 +298,10 @@ async function notifyPayoutStatusChanged({
   let userUrl = '/rewards';
 
   if (newStatus === 'paid') {
-    userMsg = `${statusEmoji} Great news, ${userName.split(' ')[0]}! Your ${typeLabel} payout of ${fmtINR(amountINR)} has been processed. ${transactionRef ? `Ref: ${transactionRef}` : ''}`.trim();
+    userMsg = `${statusEmoji} Great news, ${userName.split(' ')[0]}! Your ${typeLabel} grocery coupon payout of ${fmtINR(amountINR)} has been transferred to your bank account. ${transactionRef ? `Ref: ${transactionRef}` : ''}`.trim();
     userUrl = '/rewards/history';
   } else if (newStatus === 'processing') {
-    userMsg = `${statusEmoji} Your ${typeLabel} payout of ${fmtINR(amountINR)} is now being processed. Expected within 3–5 business days.`;
+    userMsg = `${statusEmoji} Your ${typeLabel} grocery coupon cash payout of ${fmtINR(amountINR)} is now being processed. Expected within 3–5 business days. Note: Shares and tokens earned are held and will be redeemable separately.`;
   } else if (newStatus === 'failed') {
     userMsg = `${statusEmoji} Your ${typeLabel} payout of ${fmtINR(amountINR)} could not be completed. Reason: ${failureReason || 'Please contact support'}. We'll retry soon.`;
     userUrl = '/support';
@@ -419,8 +419,13 @@ async function notifyGroceryRedemptionSubmitted({ userId, userName, amountINR, p
  * @param {number}  p.failed
  * @param {number}  p.totalINRDispatched
  */
-async function notifyBulkPayoutComplete({ adminId, adminName, processed, skipped, failed, totalINRDispatched }) {
-  const msg = `⚡ Bulk payout complete by ${adminName}: ${processed} processed (${fmtINR(totalINRDispatched)}), ${skipped} skipped, ${failed} failed.`;
+async function notifyBulkPayoutComplete({ adminId, adminName, processed, skipped, failed, totalCashINRDispatched, totalObjectRewardsHeld = {}, forcedToOnHoldCount = 0 }) {
+  const heldParts = [];
+  if (totalObjectRewardsHeld.sharesHeld > 0)        heldParts.push(`${totalObjectRewardsHeld.sharesHeld} shares`);
+  if (totalObjectRewardsHeld.referralTokenHeld > 0)  heldParts.push(`${totalObjectRewardsHeld.referralTokenHeld} tokens`);
+  const heldStr = heldParts.length > 0 ? ` | Object rewards held: ${heldParts.join(', ')}` : '';
+  const onHoldStr = forcedToOnHoldCount > 0 ? ` | ${forcedToOnHoldCount} set to on_hold (zero cash)` : '';
+  const msg = `⚡ Bulk payout complete by ${adminName}: ${processed} processed (${fmtINR(totalCashINRDispatched)} cash)${onHoldStr}, ${skipped} skipped, ${failed} failed${heldStr}.`;
 
   await dispatchToAdmins(
     msg,
@@ -434,18 +439,20 @@ async function notifyBulkPayoutComplete({ adminId, adminName, processed, skipped
         processed,
         skipped,
         failed,
-        totalINRDispatched,
+        totalCashINRDispatched,
+        totalObjectRewardsHeld,
+        forcedToOnHoldCount,
         completedAt: new Date(),
       },
     },
     {
       title:   '⚡ Bulk Payout Done',
-      message: `${processed} payouts dispatched (${fmtINR(totalINRDispatched)}) — ${failed} failed`,
+      message: `${processed} payouts dispatched (${fmtINR(totalCashINRDispatched)} cash) — ${failed} failed`,
       url:     '/admin/financial?tab=payouts',
     }
   );
 
-  console.log(`[rewardNotify] ✅ notifyBulkPayoutComplete: by=${adminId} processed=${processed} INR=${totalINRDispatched}`);
+  console.log(`[rewardNotify] ✅ notifyBulkPayoutComplete: by=${adminId} processed=${processed} cashINR=${totalCashINRDispatched} heldShares=${totalObjectRewardsHeld.sharesHeld||0} heldTokens=${totalObjectRewardsHeld.referralTokenHeld||0}`);
 }
 
 /**

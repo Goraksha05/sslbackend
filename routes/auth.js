@@ -102,4 +102,6 @@ router.post('/reset-password-with-otp', authController.resetPasswordWithOtp);
 
 router.post('/accept-terms', fetchUser, authController.acceptTerms);
 
+router.post('/save-bank-details', fetchUser, authController.saveBankDetails);
+
 module.exports = router;

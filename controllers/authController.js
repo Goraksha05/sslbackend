@@ -436,3 +436,88 @@ exports.acceptTerms = async (req, res) => {
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 };
+
+// ── Save bank details ─────────────────────────────────────────────────────────
+exports.saveBankDetails = async (req, res) => {
+  try {
+    const { accountNumber, ifscCode, panNumber, bankName } = req.body;
+ 
+    // ── 1. At least one field must be present ──────────────────────────────
+    if (!accountNumber && !ifscCode && !panNumber) {
+      return res.status(400).json({
+        success: false,
+        message: 'At least one of accountNumber, ifscCode, or panNumber is required.',
+      });
+    }
+ 
+    // ── 2. Format validation ───────────────────────────────────────────────
+    if (accountNumber && !/^\d{9,18}$/.test(accountNumber.trim())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid account number — must be 9 to 18 digits.',
+      });
+    }
+ 
+    if (ifscCode && !/^[A-Z]{4}0[A-Z0-9]{6}$/i.test(ifscCode.trim())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid IFSC code — expected format: AAAA0XXXXXX (11 characters).',
+      });
+    }
+ 
+    if (panNumber && !/^[A-Z]{5}[0-9]{4}[A-Z]$/i.test(panNumber.trim())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid PAN number — expected format: ABCDE1234F (10 characters).',
+      });
+    }
+ 
+    // ── 3. Load user ───────────────────────────────────────────────────────
+    const userId = req.user?.id || req.user?._id;
+    const user   = await User.findById(userId);
+ 
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+ 
+    // ── 4. Merge — only overwrite with non-empty incoming values ──────────
+    if (!user.bankDetails) user.bankDetails = {};
+ 
+    if (accountNumber?.trim()) {
+      user.bankDetails.accountNumber = accountNumber.trim();
+    }
+    if (ifscCode?.trim()) {
+      user.bankDetails.ifscCode = ifscCode.trim().toUpperCase();
+    }
+    if (panNumber?.trim()) {
+      user.bankDetails.panNumber = panNumber.trim().toUpperCase();
+    }
+ 
+    // bankName is informational (UI display only) — not persisted unless you
+    // add a bankDetails.bankName field to the User schema.
+    if (bankName) {
+      console.log(`[save-bank-details] user=${userId} selected bank: ${bankName}`);
+    }
+ 
+    // ── 5. Persist ────────────────────────────────────────────────────────
+    await user.save();
+ 
+    console.log(
+      `[save-bank-details] ✅ Updated for user=${userId}` +
+      ` acct=****${(user.bankDetails.accountNumber || '').slice(-4)}` +
+      ` ifsc=${user.bankDetails.ifscCode || '—'}`
+    );
+ 
+    return res.status(200).json({
+      success: true,
+      message: 'Bank details saved successfully.',
+    });
+ 
+  } catch (err) {
+    console.error('[POST /api/auth/save-bank-details]', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error while saving bank details. Please try again.',
+    });
+  }
+};

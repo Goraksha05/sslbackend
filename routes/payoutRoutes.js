@@ -95,6 +95,10 @@ router.get('/payouts/user/:userId', requirePayoutPerm, getUserPayouts);
 // Body: { status, transactionRef?, failureReason? (required for 'failed'), notes? }
 router.patch('/payouts/:payoutId/status', requirePayoutPerm, updatePayoutStatus);
 
+// GET /api/admin/payouts/unredeemed-wallets
+const { listUnredeemedWallets } = require('../controllers/financeAndPayoutController');
+router.get('/payouts/unredeemed-wallets', requirePayoutPerm, listUnredeemedWallets);
+
 // ── Main list (last — broadest match) ─────────────────────────────────────────
 
 // GET /api/admin/payouts

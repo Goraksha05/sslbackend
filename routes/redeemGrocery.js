@@ -55,7 +55,7 @@ const notifyUser         = require('../utils/notifyUser');
 const rn = require('../services/rewardNotificationService');
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MIN_BALANCE = 1;         // minimum ₹ balance required to trigger redemption
+const MIN_BALANCE = 500;         // minimum ₹ balance required to trigger redemption
 const SHARE_VAL   = 1;         // ₹ per share unit   (mirrors financeAndPayoutController)
 const TOKEN_VAL   = 1;         // ₹ per referral token
 
@@ -123,81 +123,81 @@ async function fetchPayoutAdmins() {
  * Fire notifications to all payout-eligible admins (non-blocking).
  * Failures here must never abort the user-facing response.
  */
-async function notifyAdmins(userId, userName, amount, payoutId) {
-  let admins = [];
-  try {
-    admins = await fetchPayoutAdmins();
-  } catch (err) {
-    console.error('[redeemGrocery] fetchPayoutAdmins failed:', err.message);
-    return;
-  }
+// async function notifyAdmins(userId, userName, amount, payoutId) {
+//   let admins = [];
+//   try {
+//     admins = await fetchPayoutAdmins();
+//   } catch (err) {
+//     console.error('[redeemGrocery] fetchPayoutAdmins failed:', err.message);
+//     return;
+//   }
 
-  if (!admins.length) {
-    console.warn('[redeemGrocery] No admins with manage_payouts found — notification skipped.');
-    return;
-  }
+//   if (!admins.length) {
+//     console.warn('[redeemGrocery] No admins with manage_payouts found — notification skipped.');
+//     return;
+//   }
 
-  const message =
-    `💳 ${userName} has requested grocery coupon redemption of ${fmtINR(amount)}. ` +
-    `Please review and process the payout in Admin → Reward Payouts.`;
+//   const message =
+//     `💳 ${userName} has requested grocery coupon redemption of ${fmtINR(amount)}. ` +
+//     `Please review and process the payout in Admin → Reward Payouts.`;
 
-  const pushPayload = {
-    title:   '💳 New Grocery Redemption Request',
-    message: `${userName} requested ${fmtINR(amount)} payout. Tap to review.`,
-    url:     '/admin/financial?tab=claims',
-  };
+//   const pushPayload = {
+//     title:   '💳 New Grocery Redemption Request',
+//     message: `${userName} requested ${fmtINR(amount)} payout. Tap to review.`,
+//     url:     '/admin/financial?tab=claims',
+//   };
 
-  await Promise.allSettled(
-    admins.map(async (admin) => {
-      const adminId = admin._id.toString();
-      try {
-        // 1. DB notification (admin notification bell)
-        await Notification.create({
-          user:    admin._id,
-          sender:  userId,
-          type:    'custom',
-          message,
-          url:     '/admin/financial?tab=claims',
-        });
+//   await Promise.allSettled(
+//     admins.map(async (admin) => {
+//       const adminId = admin._id.toString();
+//       try {
+//         // 1. DB notification (admin notification bell)
+//         await Notification.create({
+//           user:    admin._id,
+//           sender:  userId,
+//           type:    'custom',
+//           message,
+//           url:     '/admin/financial?tab=claims',
+//         });
 
-        // 2. Real-time socket → admin_room broadcast + personal room
-        try {
-          const io = getIO();
-          // Broadcast to the shared admin_room (RewardPayout panel listens here)
-          io.to('admin_room').emit('payout:new_request', {
-            payoutId:   payoutId.toString(),
-            userId:     userId.toString(),
-            userName,
-            amount,
-            type:       'grocery_redeem',
-            requestedAt: new Date(),
-          });
-          // Also emit to admin's personal room so their notification bell updates
-          io.to(adminId).emit('notification', {
-            type:    'custom',
-            message,
-            url:     '/admin/financial?tab=claims',
-            createdAt: new Date(),
-          });
-        } catch (sockErr) {
-          // Socket not ready or admin offline — fine, DB + push cover it
-          console.debug(`[redeemGrocery] Socket skipped for admin ${adminId}: ${sockErr.message}`);
-        }
+//         // 2. Real-time socket → admin_room broadcast + personal room
+//         try {
+//           const io = getIO();
+//           // Broadcast to the shared admin_room (RewardPayout panel listens here)
+//           io.to('admin_room').emit('payout:new_request', {
+//             payoutId:   payoutId.toString(),
+//             userId:     userId.toString(),
+//             userName,
+//             amount,
+//             type:       'grocery_redeem',
+//             requestedAt: new Date(),
+//           });
+//           // Also emit to admin's personal room so their notification bell updates
+//           io.to(adminId).emit('notification', {
+//             type:    'custom',
+//             message,
+//             url:     '/admin/financial?tab=claims',
+//             createdAt: new Date(),
+//           });
+//         } catch (sockErr) {
+//           // Socket not ready or admin offline — fine, DB + push cover it
+//           console.debug(`[redeemGrocery] Socket skipped for admin ${adminId}: ${sockErr.message}`);
+//         }
 
-        // 3. Web Push
-        await sendPushToUser(adminId, pushPayload);
+//         // 3. Web Push
+//         await sendPushToUser(adminId, pushPayload);
 
-      } catch (err) {
-        console.error(`[redeemGrocery] Notification failed for admin ${adminId}:`, err.message);
-        // Continue to other admins
-      }
-    })
-  );
+//       } catch (err) {
+//         console.error(`[redeemGrocery] Notification failed for admin ${adminId}:`, err.message);
+//         // Continue to other admins
+//       }
+//     })
+//   );
 
-  console.log(
-    `[redeemGrocery] ✅ Notified ${admins.length} admin(s) about redemption of ${fmtINR(amount)} by ${userName}`
-  );
-}
+//   console.log(
+//     `[redeemGrocery] ✅ Notified ${admins.length} admin(s) about redemption of ${fmtINR(amount)} by ${userName}`
+//   );
+// }
 
 // ── Route ─────────────────────────────────────────────────────────────────────
 
@@ -336,14 +336,14 @@ router.post(
       await user.save();
 
       // ── 8. Notify admins (fire-and-forget — never blocks response) ─────────
-      notifyAdmins(
-        user._id,
-        user.name || user.username || 'A user',
-        balance,
-        payout._id
-      ).catch(err =>
-        console.error('[redeemGrocery] notifyAdmins fire-and-forget failed:', err.message)
-      );
+      // notifyAdmins(
+      //   user._id,
+      //   user.name || user.username || 'A user',
+      //   balance,
+      //   payout._id
+      // ).catch(err =>
+      //   console.error('[redeemGrocery] notifyAdmins fire-and-forget failed:', err.message)
+      // );
 
       // ── 9. Respond ──────────────────────────────────────────────────────────
       console.log(

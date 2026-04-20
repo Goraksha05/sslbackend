@@ -5,14 +5,18 @@
 //   POST /api/admin/ban-user/:id    — ban a user (super_admin or admin with ban_users)
 //   POST /api/admin/unban-user/:id  — lift a ban  (same permission requirement)
 //
+//   GET  /api/admin/reports/activity          — paginated per-user activity report
+//   GET  /api/admin/reports/activity/export   — full export (≤5000 rows, no pagination)
+//   GET  /api/admin/reports/activity/:userId  — single-user activity detail
+//
 // Permission model:
 //   • super_admin       — always allowed (wildcard '*' from fetchUser middleware)
-//   • admin with role   — allowed only if 'ban_users' is in their permissions[]
+//   • admin with role   — allowed only if 'ban_users' / 'view_reports' is in their permissions[]
 //   • admin without it  — 403 Forbidden
 //
-// The checkPermission('ban_users') middleware enforces this; verifySuperAdmin
-// is NOT used because regular admins whose role includes 'ban_users' must also
-// be able to call these endpoints.
+// ROUTE ORDERING NOTE:
+//   /reports/activity/export must be registered BEFORE /reports/activity/:userId
+//   so Express does not treat "export" as a userId param.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express    = require('express');
@@ -24,6 +28,9 @@ const { verifyAdmin, verifySuperAdmin, checkPermission, writeAudit } = require('
 const { undoRedemption } = require('../utils/undoRewardRedemption');
 const RewardClaim = require('../models/RewardClaim');
 const mgmt       = require('../controllers/adminManagementController');
+
+// ── NEW: activity report controller ──────────────────────────────────────────
+const activityReport = require('../controllers/adminActivityReportController');
 
 // Convenience alias — keeps all existing route files that imported `isAdmin`
 // working without touching them.
@@ -261,7 +268,53 @@ router.get('/reports/financial', fetchUser, isAdmin, checkPermission('view_repor
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// USER BAN / UNBAN  ← NEW
+// ACTIVITY REPORTS  ← NEW
+// ════════════════════════════════════════════════════════════════════════════
+//
+// All three routes share the same permission: 'view_reports'.
+//
+// ORDERING IS CRITICAL:
+//   /reports/activity/export  must be declared BEFORE /reports/activity/:userId
+//   so Express matches the literal string "export" as a path segment, not as
+//   a value for the :userId param.
+//
+// GET /api/admin/reports/activity
+//   Paginated list with per-user post/referral/streak/wallet stats.
+//   Query params: page, limit, search, plan, kycStatus, subActive, from, to
+//
+// GET /api/admin/reports/activity/export
+//   Full export without pagination (max 5000 rows).
+//   Same query params as the list endpoint, no page/limit.
+//
+// GET /api/admin/reports/activity/:userId
+//   Complete activity detail for a single user — used by the admin detail drawer.
+//
+router.get(
+  '/reports/activity/export',
+  fetchUser,
+  isAdmin,
+  checkPermission('view_reports'),
+  activityReport.exportActivityReport
+);
+
+router.get(
+  '/reports/activity/:userId',
+  fetchUser,
+  isAdmin,
+  checkPermission('view_reports'),
+  activityReport.getUserActivityDetail
+);
+
+router.get(
+  '/reports/activity',
+  fetchUser,
+  isAdmin,
+  checkPermission('view_reports'),
+  activityReport.listActivityReport
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// USER BAN / UNBAN
 // ════════════════════════════════════════════════════════════════════════════
 //
 // Permission: 'ban_users'
@@ -274,9 +327,6 @@ router.get('/reports/financial', fetchUser, isAdmin, checkPermission('view_repor
 //   using the feature. checkPermission handles both cases correctly:
 //     isSuperAdmin → true  (via '*' wildcard in permissions[])
 //     permissions.includes('ban_users') → true for delegated admins
-//
-// Route order: /ban-user/:id must come BEFORE any wildcard that could
-// accidentally capture "ban-user" as a param (none here, but documented).
 //
 // POST /api/admin/ban-user/:id
 //   Body (optional): { reason: string }
