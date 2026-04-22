@@ -95,15 +95,19 @@ function mergeBankDetails(user, bankDetails) {
 }
 
 // ─── Wallet snapshot helper ────────────────────────────────────────────────────
-
 function walletSnapshot(user) {
+  const totalEarned   = user.totalGroceryCoupons  || 0;
+  const totalRedeemed = user.totalRedeemedGrocery  || 0;
   return {
-    totalGroceryCoupons:   user.totalGroceryCoupons   || 0,
-    totalShares:           user.totalShares            || 0,
-    totalReferralToken:    user.totalReferralToken     || 0,
-    redeemedReferralSlabs: user.redeemedReferralSlabs  || [],
-    redeemedPostSlabs:     user.redeemedPostSlabs      || [],
-    redeemedStreakSlabs:    user.redeemedStreakSlabs    || [],
+    totalGroceryCoupons:   totalEarned - totalRedeemed,  // available balance
+    totalEarned,
+    totalRedeemed,
+    availableBalance:      totalEarned - totalRedeemed,
+    totalShares:           user.totalShares           || 0,
+    totalReferralToken:    user.totalReferralToken    || 0,
+    redeemedReferralSlabs: user.redeemedReferralSlabs || [],
+    redeemedPostSlabs:     user.redeemedPostSlabs     || [],
+    redeemedStreakSlabs:    user.redeemedStreakSlabs   || [],
   };
 }
 

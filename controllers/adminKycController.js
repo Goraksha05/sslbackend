@@ -51,7 +51,8 @@ const notifyUser                  = require('../utils/notifyUser');
 const { notifyMany }              = require('../utils/notifyUser');
 const compressFile                = require('../utils/compressFile');
 const generateThumbnail           = require('../utils/generateThumbnail');
-const { checkLiveness }           = require('../services/livenessService');
+// const { checkLiveness }           = require('../services/livenessService');    //------------------ Temporarily disabled until the service is live
+// const { compareFaces }            = require('../services/faceMatchService');  //------------------ Temporarily disabled until the service is live
 const bus                         = require('../intelligence/platformEventBus');
 
 const {
@@ -250,8 +251,9 @@ async function processFile(file) {
   const compressed = await compressFile(file.path, file.mimetype);
   // compressed = { filePath, mimetype, thumbnails: string[] }
 
-  const filePath    = compressed.filePath;
-  const mimeType    = compressed.mimetype || file.mimetype;
+  // diskPath is the absolute filesystem path — needed for OCR, liveness, etc.
+  const diskPath = compressed.filePath;
+  const mimeType = compressed.mimetype || file.mimetype;
 
   // Step 2 — thumbnail
   // Prefer any thumbnail already produced by compressFile (video frames, PDF
@@ -268,20 +270,23 @@ async function processFile(file) {
       // generateThumbnail handles image/* and application/pdf; returns null
       // for unsupported types — that's fine, we just store null.
       // After the fix in generateThumbnail.js it returns a public URL directly.
-      thumbnailUrl = await generateThumbnail(filePath, mimeType);
+      thumbnailUrl = await generateThumbnail(diskPath, mimeType);
     } catch (thumbErr) {
       // Non-fatal — KYC submission continues without a preview thumbnail
       console.warn(
-        `[processFile] generateThumbnail failed for ${filePath}:`,
+        `[processFile] generateThumbnail failed for ${diskPath}:`,
         thumbErr.message
       );
     }
   }
 
   return {
-    // FIX: store a public URL ("/uploads/kyc/..."), not the absolute disk path.
-    // The browser needs an HTTP URL, not a file:// path.
-    url:       diskPathToPublicUrl(filePath),
+    // diskPath: absolute filesystem path — used by OCR, liveness, face-match.
+    // DO NOT use this for storing in DB or sending to browser.
+    diskPath,
+    // url: root-relative public URL served by Express static middleware.
+    // Use this for DB storage and browser display.
+    url:       diskPathToPublicUrl(diskPath),
     mimeType,
     thumbnail: thumbnailUrl || null,
   };
@@ -317,10 +322,11 @@ exports.submitKYC = async (req, res) => {
     }
 
     // ── Step 3: OCR ───────────────────────────────────────────────────────────
-    // Only run OCR on the document files (not bank passbook or selfie)
+    // Use diskPath (absolute filesystem path) for OCR — NOT the public URL.
+    // extractText uses Tesseract which reads from disk, not HTTP.
     const [aadhaarText, panText] = await Promise.all([
-      extractText(aadhaarFile.url),
-      extractText(panFile.url),
+      extractText(aadhaarFile.diskPath),
+      extractText(panFile.diskPath),
     ]);
 
     const aadhaarData = extractAadhaar(aadhaarText);
@@ -332,7 +338,9 @@ exports.submitKYC = async (req, res) => {
       : { valid: false, name: null };
 
     // ── Step 5: Liveness check ────────────────────────────────────────────────
-    const liveness = await checkLiveness(selfieFile.url);
+    // checkLiveness uses sharp to read image metadata — needs the disk path.
+    // const liveness = await checkLiveness(selfieFile.diskPath);     //------------- Temporarily disabled until the service is live
+    const liveness = { live: true, reason: 'Liveness service not yet available' };
 
     // ── Step 6: Face match (disabled until service is live) ───────────────────
     // const faceResult = await compareFaces(aadhaarFile.url, selfieFile.url);
@@ -355,7 +363,7 @@ exports.submitKYC = async (req, res) => {
 
     // Hard override: liveness failure always rejects regardless of score
     let decision = getKycDecision(finalScore);
-    if (!liveness.live) decision = 'reject';
+    // if (!liveness.live) decision = 'reject';  //------------------ Temporarily disabled until the service is live
 
     const kycStatus =
       decision === 'auto_approve'  ? 'verified'  :

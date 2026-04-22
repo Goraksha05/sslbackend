@@ -103,6 +103,7 @@ const UserSchema = new Schema({
   },
 
   totalGroceryCoupons: { type: Number, default: 0 },
+  totalRedeemedGrocery:  { type: Number, default: 0 },
   totalShares:         { type: Number, default: 0 },
   totalReferralToken:  { type: Number, default: 0 },
 
@@ -267,6 +268,8 @@ UserSchema.pre('save', async function (next) {
     next(err);
   }
 });
+
+UserSchema.index({ 'totalRedeemedGrocery': 1 });
 
 const User = mongoose.model('user', UserSchema);
 module.exports = User;

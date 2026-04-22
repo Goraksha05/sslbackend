@@ -2,73 +2,47 @@
  * routes/redeemGrocery.js
  *
  * POST /api/activity/redeem-grocery-coupons
+ * GET  /api/activity/redemption-status
+ * DELETE /api/activity/redemption-cancel
  *
- * Allows a verified, subscribed user to request cash redemption of their
- * accumulated grocery coupons.
+ * User-initiated grocery coupon redemption flow.
  *
- * WHAT IT DOES:
- *   1. Validates eligibility (KYC verified, active subscription, balance > 0,
- *      rewards not frozen, no pending redemption already in flight).
- *   2. Updates user bank details if provided (upserts, never overwrites with null).
- *   3. Creates a RewardClaim of type 'grocery_redeem' to act as the paper trail.
- *   4. Creates a Payout document (status: 'pending') so admins see it immediately
- *      in the RewardPayout admin panel.
- *   5. Notifies every admin / super_admin who has the 'manage_payouts' permission
- *      via three channels: DB notification, Socket.IO (admin_room), and Web Push.
- *   6. Returns a structured response the frontend can use to update the UI.
+ * FLOW:
+ *   User Panel  →  POST /redeem-grocery-coupons  →  Payout(status:'pending')
+ *   Admin Panel →  sees it in "Pending Claims" tab (rewardType:'grocery_redeem')
+ *   Admin pays  →  PATCH /api/admin/payouts/:id/status → status:'paid'
+ *   Admin ONLY pays what users explicitly requested.
  *
- * MOUNT IN index.js (inside the protected apiLimiter block, NOT the admin router):
- *   app.use('/api/activity', require('./routes/redeemGrocery'));
- *
- * Or if activity.js is already a file-based router, add the route there:
- *   router.post('/redeem-grocery-coupons', fetchUser, requireRewardEligibility, handler);
- *
- * ADMIN NOTIFICATION CHANNELS:
- *   • Notification model  — persists for admin notification bell
- *   • Socket.IO           — emitted to 'admin_room' for real-time dashboard update
- *   • Web Push            — sent to every admin with a PushSubscription
- *
- * IDEMPOTENCY:
- *   The route prevents duplicate "in-flight" redemptions by checking for an
- *   existing Payout document in 'pending' or 'processing' state for the same
- *   user.  A user can submit a new redemption only after their previous one
- *   reaches 'paid' or 'failed'.
+ * WHAT CHANGED vs original:
+ *   - cashAmountINR field is now set on Payout (was only totalAmountINR before)
+ *   - objectRewardsHeld set to zero (grocery redemption is pure cash)
+ *   - redemption-status endpoint added so User Panel can poll current state
+ *   - redemption-cancel endpoint added so user can cancel a 'pending' request
+ *   - userRequested flag added to Payout so admin can distinguish
+ *     user-initiated vs admin-initiated payouts
  */
 
 'use strict';
 
-const express   = require('express');
-const router    = express.Router();
+const express = require('express');
+const router  = express.Router();
 
-const User           = require('../models/User');
-const Notification   = require('../models/Notification');
-const PushSubscription = require('../models/PushSubscription');
-const RewardClaim    = require('../models/RewardClaim');
-const Payout         = require('../models/PayoutSchema');
+const User        = require('../models/User');
+const RewardClaim = require('../models/RewardClaim');
+const Payout      = require('../models/PayoutSchema');
 
-const fetchUser               = require('../middleware/fetchuser');
+const fetchUser                = require('../middleware/fetchuser');
 const requireRewardEligibility = require('../middleware/requireRewardEligibility');
-
-const { getIO }         = require('../sockets/IOsocket');
-const { sendPushToUser } = require('../utils/pushService');
-const notifyUser         = require('../utils/notifyUser');
 const rn = require('../services/rewardNotificationService');
-// ── Constants ─────────────────────────────────────────────────────────────────
 
-const MIN_BALANCE = 500;         // minimum ₹ balance required to trigger redemption
-const SHARE_VAL   = 1;         // ₹ per share unit   (mirrors financeAndPayoutController)
-const TOKEN_VAL   = 1;         // ₹ per referral token
+// ── Constants ──────────────────────────────────────────────────────────────────
+const MIN_BALANCE = 500; // minimum ₹ balance to trigger redemption
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
+// ── Helpers ────────────────────────────────────────────────────────────────────
 function fmtINR(n) {
   return `₹${(n ?? 0).toLocaleString('en-IN')}`;
 }
 
-/**
- * Merge incoming bank detail fields onto the user document.
- * Only overwrites a field when the incoming value is non-empty.
- */
 function mergeBankDetails(user, bankDetails) {
   if (!bankDetails) return;
   if (!user.bankDetails) user.bankDetails = {};
@@ -80,187 +54,55 @@ function mergeBankDetails(user, bankDetails) {
     user.bankDetails.panNumber = bankDetails.panNumber.trim().toUpperCase();
 }
 
-/**
- * Fetch all admin users who have the 'manage_payouts' permission.
- * Returns a lean array of { _id, name, email, role, adminPermissions }.
- *
- * We check:
- *   • role === 'super_admin'          — always has all permissions (wildcard)
- *   • role === 'admin' AND (
- *       adminPermissions includes 'manage_payouts'  OR
- *       adminRole.permissions includes 'manage_payouts'
- *     )
- */
-async function fetchPayoutAdmins() {
-  const AdminRole = require('../models/AdminRole');
-
-  // Load all admin roles that contain 'manage_payouts'
-  const rolesWithPerm = await AdminRole.find({
-    permissions: 'manage_payouts',
-  }).select('_id').lean();
-
-  const roleIds = rolesWithPerm.map(r => r._id);
-
-  const admins = await User.find({
-    $or: [
-      { role: 'super_admin' },
-      {
-        role: 'admin',
-        $or: [
-          { adminPermissions: 'manage_payouts' },
-          { adminRole: { $in: roleIds } },
-        ],
-      },
-    ],
-  })
-    .select('_id name email role')
-    .lean();
-
-  return admins;
-}
-
-/**
- * Fire notifications to all payout-eligible admins (non-blocking).
- * Failures here must never abort the user-facing response.
- */
-// async function notifyAdmins(userId, userName, amount, payoutId) {
-//   let admins = [];
-//   try {
-//     admins = await fetchPayoutAdmins();
-//   } catch (err) {
-//     console.error('[redeemGrocery] fetchPayoutAdmins failed:', err.message);
-//     return;
-//   }
-
-//   if (!admins.length) {
-//     console.warn('[redeemGrocery] No admins with manage_payouts found — notification skipped.');
-//     return;
-//   }
-
-//   const message =
-//     `💳 ${userName} has requested grocery coupon redemption of ${fmtINR(amount)}. ` +
-//     `Please review and process the payout in Admin → Reward Payouts.`;
-
-//   const pushPayload = {
-//     title:   '💳 New Grocery Redemption Request',
-//     message: `${userName} requested ${fmtINR(amount)} payout. Tap to review.`,
-//     url:     '/admin/financial?tab=claims',
-//   };
-
-//   await Promise.allSettled(
-//     admins.map(async (admin) => {
-//       const adminId = admin._id.toString();
-//       try {
-//         // 1. DB notification (admin notification bell)
-//         await Notification.create({
-//           user:    admin._id,
-//           sender:  userId,
-//           type:    'custom',
-//           message,
-//           url:     '/admin/financial?tab=claims',
-//         });
-
-//         // 2. Real-time socket → admin_room broadcast + personal room
-//         try {
-//           const io = getIO();
-//           // Broadcast to the shared admin_room (RewardPayout panel listens here)
-//           io.to('admin_room').emit('payout:new_request', {
-//             payoutId:   payoutId.toString(),
-//             userId:     userId.toString(),
-//             userName,
-//             amount,
-//             type:       'grocery_redeem',
-//             requestedAt: new Date(),
-//           });
-//           // Also emit to admin's personal room so their notification bell updates
-//           io.to(adminId).emit('notification', {
-//             type:    'custom',
-//             message,
-//             url:     '/admin/financial?tab=claims',
-//             createdAt: new Date(),
-//           });
-//         } catch (sockErr) {
-//           // Socket not ready or admin offline — fine, DB + push cover it
-//           console.debug(`[redeemGrocery] Socket skipped for admin ${adminId}: ${sockErr.message}`);
-//         }
-
-//         // 3. Web Push
-//         await sendPushToUser(adminId, pushPayload);
-
-//       } catch (err) {
-//         console.error(`[redeemGrocery] Notification failed for admin ${adminId}:`, err.message);
-//         // Continue to other admins
-//       }
-//     })
-//   );
-
-//   console.log(
-//     `[redeemGrocery] ✅ Notified ${admins.length} admin(s) about redemption of ${fmtINR(amount)} by ${userName}`
-//   );
-// }
-
-// ── Route ─────────────────────────────────────────────────────────────────────
-
-/**
- * POST /api/activity/redeem-grocery-coupons
- *
- * Body (all optional unless user has no bank details on file):
- *   bankDetails  { accountNumber, ifscCode, panNumber }
- *   notes        string   — admin-facing note from user
- */
+// ── POST /api/activity/redeem-grocery-coupons ─────────────────────────────────
 router.post(
   '/redeem-grocery-coupons',
   fetchUser,
-  requireRewardEligibility,   // ensures KYC verified + active subscription + not frozen
+  requireRewardEligibility,
   async (req, res) => {
     const { bankDetails, notes } = req.body;
 
     try {
-      // ── 1. Load fresh user document ─────────────────────────────────────────
       const user = await User.findById(req.user.id);
       if (!user) {
         return res.status(404).json({ message: 'User not found.', code: 'USER_NOT_FOUND' });
       }
 
-      // ── 2. Balance guard ────────────────────────────────────────────────────
-      const balance = user.totalGroceryCoupons ?? 0;
+      // ── Balance guard ──────────────────────────────────────────────────────
+      // COMPUTE available balance (ledger model)
+      const earned   = user.totalGroceryCoupons  ?? 0;
+      const redeemed = user.totalRedeemedGrocery ?? 0;
+      const balance  = earned - redeemed;
+
       if (balance < MIN_BALANCE) {
         return res.status(400).json({
-          message: `You need at least ${fmtINR(MIN_BALANCE)} in grocery coupons to redeem. Your current balance is ${fmtINR(balance)}.`,
+          message: `Minimum ${fmtINR(MIN_BALANCE)} required to redeem. Your balance: ${fmtINR(balance)}.`,
           code: 'INSUFFICIENT_BALANCE',
+          balance,
+          minimumRequired: MIN_BALANCE,
         });
       }
 
-      // ── 3. Idempotency guard — no duplicate pending redemptions ─────────────
-      // Look for an existing Payout of type 'grocery_redeem' in a non-terminal state.
+      // ── Idempotency — no duplicate in-flight redemptions ───────────────────
       const existingPayout = await Payout.findOne({
         user:       user._id,
         rewardType: 'grocery_redeem',
         status:     { $in: ['pending', 'processing', 'on_hold'] },
-      }).lean();
+      }).select('_id status totalAmountINR createdAt').lean();
 
       if (existingPayout) {
         return res.status(409).json({
           message:
             `You already have a redemption request in progress (status: ${existingPayout.status}). ` +
-            `Please wait for it to be processed before submitting a new request.`,
+            `Wait for it to be processed before submitting a new request.`,
           code: 'REDEMPTION_ALREADY_PENDING',
-          existingPayoutId: String(existingPayout._id),
+          existingPayoutId:     String(existingPayout._id),
+          existingPayoutStatus: existingPayout.status,
+          existingAmount:       existingPayout.totalAmountINR,
         });
       }
 
-      // ── 4. Bank details guard ───────────────────────────────────────────────
-      const hasBankDetails =
-        !!user.bankDetails?.accountNumber && !!user.bankDetails?.ifscCode;
-
-      if (!hasBankDetails && !bankDetails) {
-        return res.status(400).json({
-          message: 'Bank account details are required to process the redemption. Please provide your account number, IFSC code, and PAN.',
-          code: 'BANK_DETAILS_REQUIRED',
-        });
-      }
-
-      // Validate incoming bank details if provided
+      // ── Bank details ───────────────────────────────────────────────────────
       if (bankDetails) {
         if (bankDetails.accountNumber && !/^\d{9,18}$/.test(bankDetails.accountNumber)) {
           return res.status(400).json({ message: 'Invalid bank account number.', code: 'INVALID_BANK_DETAILS' });
@@ -274,42 +116,79 @@ router.post(
         mergeBankDetails(user, bankDetails);
       }
 
-      // ── 5. Create RewardClaim (paper trail) ────────────────────────────────
-      // Use a custom milestone string that encodes the amount for easy admin lookup.
-      const milestoneParts = `${balance}_groceryCoupons`;
+      const hasBankDetails = !!(user.bankDetails?.accountNumber && user.bankDetails?.ifscCode);
+      if (!hasBankDetails) {
+        return res.status(400).json({
+          message: 'Bank account details required. Please provide your account number and IFSC code.',
+          code: 'BANK_DETAILS_REQUIRED',
+        });
+      }
 
+      // ── ATOMIC DEBIT: increment totalRedeemedGrocery ───────────────────────────
+      const updatedUser = await User.findOneAndUpdate(
+        {
+          _id: user._id,
+          // Guard: ensure (earned - redeemed) is still >= balance at the moment of write
+          // Equivalent: totalGroceryCoupons - totalRedeemedGrocery >= balance
+          // Rearranged: totalGroceryCoupons >= totalRedeemedGrocery + balance
+          $expr: {
+            $gte: [
+              '$totalGroceryCoupons',
+              { $add: [{ $ifNull: ['$totalRedeemedGrocery', 0] }, balance] },
+            ],
+          },
+        },
+        {
+          $inc: { totalRedeemedGrocery: balance },
+          // Also persist any bank detail changes
+          $set: { bankDetails: user.bankDetails },
+        },
+        { new: true }
+      );
+
+      if (!updatedUser) {
+        // Race condition: another concurrent redemption was processed between our
+        // read and this write. Reject cleanly.
+        return res.status(409).json({
+          message: 'Your balance changed while processing. Please try again.',
+          code: 'CONCURRENT_REDEMPTION',
+        });
+      }
+
+      // ── Create RewardClaim (audit trail) ───────────────────────────────────
+      const milestoneKey = `${balance}_groceryCoupons`;
       let rewardClaim;
       try {
         rewardClaim = await RewardClaim.create({
           user:      user._id,
           type:      'grocery_redeem',
-          milestone: milestoneParts,
+          milestone: milestoneKey,
         });
       } catch (claimErr) {
-        // Unique index violation — another concurrent request just created the claim
         if (claimErr.code === 11000) {
           return res.status(409).json({
-            message: 'A redemption request was already submitted. Please wait for it to be processed.',
+            message: 'A redemption request was already submitted. Please wait for processing.',
             code: 'REDEMPTION_ALREADY_PENDING',
           });
         }
         throw claimErr;
       }
 
-      // ── 6. Create Payout document (admin panel picks this up) ──────────────
+      // ── Bank snapshot at time of request ───────────────────────────────────
       const bankSnapshot = {
         accountNumber: user.bankDetails?.accountNumber || null,
         ifscCode:      user.bankDetails?.ifscCode      || null,
         panNumber:     user.bankDetails?.panNumber      || null,
       };
 
-      const totalAmountINR = balance;   // grocery coupons are already in ₹
-
+      // ── Create Payout document ──────────────────────────────────────────────
+      // userRequested: true flags this as user-initiated so admin knows to pay it.
+      // Admin-initiated payouts (slab rewards) set userRequested: false.
       const payout = await Payout.create({
         user:          user._id,
         rewardClaim:   rewardClaim._id,
         rewardType:    'grocery_redeem',
-        milestone:     milestoneParts,
+        milestone:     milestoneKey,
         planKey:       user.subscription?.planAmount
           ? String(user.subscription.planAmount)
           : '2500',
@@ -318,55 +197,127 @@ router.post(
           shares:         0,
           referralToken:  0,
         },
-        totalAmountINR,
-        bankSnapshot,
-        status:  'pending',
-        notes:   notes
+        // CASH payout — grocery coupons are ₹ face value
+        cashAmountINR:     balance,
+        totalAmountINR:    balance,
+        objectRewardsHeld: { sharesHeld: 0, referralTokenHeld: 0 },
+        bankDetails:       bankSnapshot,
+        status:            'pending',
+        userRequested:     true,   // key flag: admin should pay this
+        notes: notes
           ? `User note: ${notes}`
-          : `Grocery coupon redemption request — ${fmtINR(balance)} — submitted ${new Date().toLocaleDateString('en-IN')}`,
+          : `User-requested grocery redemption — ${fmtINR(balance)} — ${new Date().toLocaleDateString('en-IN')}`,
       });
+
+      // ── Persist bank detail updates ─────────────────────────────────────────
+      await user.save();
+
+      // ── Notify admins (fire-and-forget) ────────────────────────────────────
       rn.notifyGroceryRedemptionSubmitted({
         userId:    user._id,
         userName:  user.name || user.username,
         amountINR: balance,
         payoutId:  payout._id,
-      }).catch(err => console.warn('[notify]', err.message));
+      }).catch(err => console.warn('[redeemGrocery] notify failed:', err.message));
 
-      // ── 7. Persist updated bank details + save ──────────────────────────────
-      await user.save();
-
-      // ── 8. Notify admins (fire-and-forget — never blocks response) ─────────
-      // notifyAdmins(
-      //   user._id,
-      //   user.name || user.username || 'A user',
-      //   balance,
-      //   payout._id
-      // ).catch(err =>
-      //   console.error('[redeemGrocery] notifyAdmins fire-and-forget failed:', err.message)
-      // );
-
-      // ── 9. Respond ──────────────────────────────────────────────────────────
       console.log(
-        `[redeemGrocery] ✅ Redemption request created: user=${user._id} amount=${fmtINR(balance)} payout=${payout._id}`
+        `[redeemGrocery] ✅ user=${user._id} amount=${fmtINR(balance)} payout=${payout._id}`
       );
 
+      const newEarned   = updatedUser.totalGroceryCoupons   ?? 0;
+      const newRedeemed = updatedUser.totalRedeemedGrocery  ?? 0;
+
       return res.status(201).json({
-        success:        true,
-        message:        `Your grocery coupon redemption of ${fmtINR(balance)} has been submitted. The finance team will process it within 3–5 working days.`,
-        payoutId:       payout._id,
-        rewardClaimId:  rewardClaim._id,
-        amount:         balance,
-        status:         'pending',
+        success:       true,
+        message:       `Your redemption of ${fmtINR(balance)} has been submitted. ...`,
+        payoutId:      payout._id,
+        rewardClaimId: rewardClaim._id,
+        amount:        balance,
+        status:        'pending',
+        submittedAt:   payout.createdAt,
+        // ← NEW: wallet snapshot so the frontend can update without a second fetch
+        wallet: {
+          totalEarned:     newEarned,
+          totalRedeemed:   newRedeemed,
+          availableBalance: newEarned - newRedeemed,
+        },
       });
 
     } catch (err) {
       console.error('[POST /redeem-grocery-coupons]', err);
       return res.status(500).json({
-        message: 'Server error while processing your redemption request. Please try again.',
+        message: 'Server error while processing your request. Please try again.',
         code: 'SERVER_ERROR',
       });
     }
   }
 );
+
+// ── GET /api/activity/redemption-status ───────────────────────────────────────
+// Returns the user's most recent grocery redemption payout (if any).
+// User Panel uses this to show the current redemption status card.
+router.get('/redemption-status', fetchUser, async (req, res) => {
+  try {
+    const payout = await Payout.findOne({
+      user:       req.user.id,
+      rewardType: 'grocery_redeem',
+    })
+      .sort({ createdAt: -1 })
+      .select('status totalAmountINR cashAmountINR createdAt paidAt transactionRef failureReason notes userRequested')
+      .lean();
+
+    if (!payout) {
+      return res.json({ hasRedemption: false });
+    }
+
+    return res.json({
+      hasRedemption: true,
+      payoutId:      payout._id,
+      status:        payout.status,
+      amount:        payout.cashAmountINR ?? payout.totalAmountINR ?? 0,
+      submittedAt:   payout.createdAt,
+      paidAt:        payout.paidAt || null,
+      transactionRef: payout.transactionRef || null,
+      failureReason:  payout.failureReason  || null,
+      canRequestNew:  ['paid', 'failed'].includes(payout.status),
+    });
+  } catch (err) {
+    console.error('[GET /redemption-status]', err);
+    return res.status(500).json({ message: 'Failed to fetch redemption status.' });
+  }
+});
+
+// ── DELETE /api/activity/redemption-cancel ────────────────────────────────────
+// Allows user to cancel a 'pending' redemption before admin processes it.
+router.delete('/redemption-cancel', fetchUser, async (req, res) => {
+  try {
+    const payout = await Payout.findOne({
+      user:       req.user.id,
+      rewardType: 'grocery_redeem',
+      status:     'pending',   // can only cancel if still pending (not yet picked up)
+    });
+
+    if (!payout) {
+      return res.status(404).json({
+        message: 'No cancellable redemption request found. Requests in processing or paid state cannot be cancelled.',
+        code: 'NOT_CANCELLABLE',
+      });
+    }
+
+    payout.status = 'failed';
+    payout.failureReason = 'Cancelled by user';
+    payout.notes = `${payout.notes}\nCancelled by user on ${new Date().toLocaleDateString('en-IN')}`;
+    await payout.save();
+
+    return res.json({
+      success: true,
+      message: 'Your redemption request has been cancelled.',
+      payoutId: payout._id,
+    });
+  } catch (err) {
+    console.error('[DELETE /redemption-cancel]', err);
+    return res.status(500).json({ message: 'Failed to cancel redemption request.' });
+  }
+});
 
 module.exports = router;

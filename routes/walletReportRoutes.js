@@ -131,27 +131,36 @@ router.get('/wallet-report', requireView, async (req, res) => {
 
     const pendingMap = await enrichWithPendingClaims(users);
 
-    const rows = users.map(u => ({
-      _id:            String(u._id),
-      name:           u.name,
-      email:          u.email,
-      username:       u.username,
-      phone:          u.phone || '—',
-      referralId:     u.referralId || '—',
-      plan:           u.subscription?.plan     || 'None',
-      planAmount:     u.subscription?.planAmount || null,
-      subActive:      !!u.subscription?.active,
-      kycStatus:      u.kyc?.status || 'not_started',
-      hasBankDetails: !!(u.bankDetails?.accountNumber && u.bankDetails?.ifscCode),
-      lastActive:     u.lastActive || null,
-      joinDate:       u.date || null,
-      // Wallet fields
-      groceryCoupons: u.totalGroceryCoupons || 0,   // ₹ cash
-      shares:         u.totalShares         || 0,   // unit count
-      referralToken:  u.totalReferralToken  || 0,   // unit count
-      // Pending claim ids for the Pay button
-      pendingClaimIds: pendingMap[String(u._id)] || [],
-    }));
+    const rows = users.map(u => {
+      const earned   = u.totalGroceryCoupons   || 0;
+      const redeemed = u.totalRedeemedGrocery  || 0;   // ← NEW FIELD (from User model fix)
+      const available = earned - redeemed;
+
+      return {
+        _id:            String(u._id),
+        name:           u.name,
+        email:          u.email,
+        username:       u.username,
+        phone:          u.phone || '—',
+        referralId:     u.referralId || '—',
+        plan:           u.subscription?.plan     || 'None',
+        planAmount:     u.subscription?.planAmount || null,
+        subActive:      !!u.subscription?.active,
+        kycStatus:      u.kyc?.status || 'not_started',
+        hasBankDetails: !!(u.bankDetails?.accountNumber && u.bankDetails?.ifscCode),
+        lastActive:     u.lastActive || null,
+        joinDate:       u.date || null,
+        // Wallet fields
+        groceryCoupons: available,   // ₹ cash
+        totalEarned:    earned,
+        totalRedeemed:  redeemed,
+        availableBalance: available,
+        shares:         u.totalShares         || 0,   // unit count
+        referralToken:  u.totalReferralToken  || 0,   // unit count
+        // Pending claim ids for the Pay button
+        pendingClaimIds: pendingMap[String(u._id)] || [],
+      }
+    });
 
     return res.json({
       rows,
@@ -194,7 +203,9 @@ router.get('/wallet-report/export', requireView, async (req, res) => {
       SubscriptionActive: u.subscription?.active ? 'Yes' : 'No',
       KYC:               u.kyc?.status || 'not_started',
       BankDetails:       (u.bankDetails?.accountNumber && u.bankDetails?.ifscCode) ? 'Yes' : 'No',
-      'Grocery Coupons (₹)': u.totalGroceryCoupons || 0,
+      'Available Balance (₹)': available,
+      'Total Earned (₹)':      earned,
+      'Total Redeemed (₹)':    redeemed,
       'Shares (units)':       u.totalShares         || 0,
       'Referral Tokens':      u.totalReferralToken  || 0,
       'Pending Claims':  (pendingMap[String(u._id)] || []).length,

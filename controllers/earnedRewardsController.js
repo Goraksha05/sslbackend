@@ -53,7 +53,7 @@ function extractReward(slab) {
 async function getEarnedRewards(req, res) {
   try {
     const user = await User.findById(req.user.id).select(
-      'subscription totalGroceryCoupons totalShares totalReferralToken ' +
+      'subscription totalGroceryCoupons totalRedeemedGrocery totalShares totalReferralToken ' +
       'redeemedStreakSlabs redeemedReferralSlabs redeemedPostSlabs bankDetails ' +
       'kyc.status kyc.verifiedAt trustFlags'
     );
@@ -125,10 +125,19 @@ async function getEarnedRewards(req, res) {
       };
     });
 
+    const totalEarned   = user.totalGroceryCoupons  ?? 0;
+    const totalRedeemed = user.totalRedeemedGrocery  ?? 0;
+
     const wallet = {
-      totalGroceryCoupons: user.totalGroceryCoupons ?? 0,
-      totalShares:         user.totalShares ?? 0,
-      totalReferralToken:  user.totalReferralToken ?? 0,
+      // Legacy field kept for backward compatibility — contains AVAILABLE balance
+      totalGroceryCoupons:  totalEarned - totalRedeemed,   // ← COMPUTED, not raw field
+      // New explicit fields for any consumer that wants the full ledger picture
+      totalEarned,
+      totalRedeemed,
+      availableBalance:     totalEarned - totalRedeemed,
+      // Non-cash assets unchanged
+      totalShares:          user.totalShares ?? 0,
+      totalReferralToken:   user.totalReferralToken ?? 0,
     };
 
     const redeemed = {

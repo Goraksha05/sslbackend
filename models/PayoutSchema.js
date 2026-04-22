@@ -1,3 +1,18 @@
+// models/PayoutSchema.js  (UPDATED)
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGES:
+//   NEW — userRequested {Boolean}
+//     true  → user explicitly requested this payout via POST /redeem-grocery-coupons
+//     false → admin created this payout for a slab reward (post/referral/streak)
+//
+//   This flag separates two distinct flows in the admin panel:
+//     • Pending Claims tab: shows slab reward claims + user-requested grocery redemptions
+//     • Unredeemed Wallets tab: shows wallet balances NOT yet requested by user
+//
+//   Admin ONLY pays what the user explicitly requested (userRequested:true).
+//   Unredeemed wallet balances stay pending until the user submits a request.
+// ─────────────────────────────────────────────────────────────────────────────
+
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
 
@@ -13,9 +28,8 @@ const PayoutSchema = new Schema(
 
     // ── Source claim ─────────────────────────────────────────────────────────
     rewardClaim: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref:  'RewardClaim',
-      index: false, // indexed via unique index below
+      type:  mongoose.Schema.Types.ObjectId,
+      ref:   'RewardClaim',
     },
 
     // ── Reward metadata ───────────────────────────────────────────────────────
@@ -25,51 +39,54 @@ const PayoutSchema = new Schema(
       required: true,
     },
     milestone: {
-      type: mongoose.Schema.Types.Mixed, // number (posts/referrals) or string (e.g. "30days")
+      type: mongoose.Schema.Types.Mixed,
     },
     planKey: {
-      type: String, // '2500' | '3500' | '4500'
+      type: String,
     },
 
-    // ── INR breakdown (all in ₹) ──────────────────────────────────────────────
-    // Stores the raw unit counts for every reward currency from the slab.
-    // Only groceryCoupons are a cash reward — shares and referralToken are
-    // object rewards and are NOT paid out as cash (handled separately later).
+    // ── User-requested flag ────────────────────────────────────────────────
+    // NEW: true = user explicitly clicked "Redeem" in their panel.
+    //      false (default) = admin-created payout for a slab reward.
+    //
+    // Admin should only PAY payouts where userRequested === true.
+    // Non-requested grocery coupon balances sit in "Unredeemed Wallets" tab
+    // and are only paid AFTER the user submits a redemption request.
+    userRequested: {
+      type:    Boolean,
+      default: false,
+      index:   true,
+    },
+
+    // ── INR breakdown ─────────────────────────────────────────────────────────
     breakdown: {
-      groceryCoupons: { type: Number, default: 0 },  // ₹ value of coupons (cash)
-      shares:         { type: Number, default: 0 },  // units (object reward — NOT cash)
-      referralToken:  { type: Number, default: 0 },  // tokens (object reward — NOT cash)
+      groceryCoupons: { type: Number, default: 0 },
+      shares:         { type: Number, default: 0 },
+      referralToken:  { type: Number, default: 0 },
     },
 
-    // ── Cash payout amount (grocery coupons only, in ₹) ──────────────────────
-    // This is the ONLY amount that gets transferred to the user's bank account.
-    // Shares and referral tokens are non-cash object rewards and are held until
-    // a separate redemption flow (to be built) handles them.
+    // ── Cash payout amount (only grocery coupons, in ₹) ──────────────────────
+    // This is the ONLY amount transferred to the user's bank.
+    // Shares and referral tokens are non-cash object rewards (held separately).
     cashAmountINR: {
       type:     Number,
       required: true,
       default:  0,
     },
 
-    // ── Object rewards held (non-cash, informational only) ───────────────────
-    // Populated at payout creation time so admins can see what was held.
-    // Will be cleared / consumed once the shares/tokens redemption flow ships.
+    // ── Object rewards held (non-cash) ────────────────────────────────────────
     objectRewardsHeld: {
-      sharesHeld:        { type: Number, default: 0 }, // units NOT paid in cash
-      referralTokenHeld: { type: Number, default: 0 }, // tokens NOT paid in cash
+      sharesHeld:        { type: Number, default: 0 },
+      referralTokenHeld: { type: Number, default: 0 },
     },
 
-    // ── Legacy total field (kept for backward compatibility) ─────────────────
-    // Previously held groceryCoupons + shares×₹1 + tokens×₹1.
-    // Now equals cashAmountINR (grocery coupons only).
-    // Will be removed in a future migration — always use cashAmountINR for
-    // financial calculations going forward.
+    // ── Legacy total field (kept for backward compat — equals cashAmountINR) ──
     totalAmountINR: {
       type:     Number,
       required: true,
     },
 
-    // ── Bank / transfer details (populated at payout time) ───────────────────
+    // ── Bank details snapshot at payout creation time ─────────────────────────
     bankDetails: {
       accountNumber: { type: String, default: null },
       ifscCode:      { type: String, default: null },
@@ -84,11 +101,9 @@ const PayoutSchema = new Schema(
       index:   true,
     },
 
-    // Reference ID from external payment gateway (Razorpay payout, NEFT ref, etc.)
     transactionRef: { type: String, default: null },
-
-    notes:         { type: String, default: '' },
-    failureReason: { type: String, default: null },
+    notes:          { type: String, default: '' },
+    failureReason:  { type: String, default: null },
 
     // ── Admin trail ───────────────────────────────────────────────────────────
     processedBy: {
@@ -103,6 +118,10 @@ const PayoutSchema = new Schema(
 
 // Prevent double-processing the same RewardClaim
 PayoutSchema.index({ rewardClaim: 1 }, { unique: true, sparse: true });
+
+// Index for user-requested grocery redemption queries
+PayoutSchema.index({ rewardType: 1, userRequested: 1, status: 1 });
+PayoutSchema.index({ user: 1, rewardType: 1, userRequested: 1, status: 1 });
 
 const Payout = mongoose.models.Payout || mongoose.model('Payout', PayoutSchema);
 module.exports = Payout;
