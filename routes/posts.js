@@ -18,7 +18,7 @@ const Profile = require('../models/Profile');
 const Comment = require('../models/Comment');
 const compressFile = require("../utils/compressFile");
 const Notification = require('../models/Notification');
-const { getIO } = require('../sockets/IOsocket');
+const { getIO } = require('../sockets/socketManager');
 const { sendPushToUser } = require('../utils/pushService');
 const notifyUser = require('../utils/notifyUser');
 const moderateMedia = require('../utils/moderateMedia');
@@ -423,7 +423,7 @@ router.post('/:postId/comments', fetchUser, async (req, res) => {
         const saved = await newComment.save();
         await saved.populate('userId', 'name');
 
-        const { getIO } = require('../sockets/IOsocket');
+        const { getIO } = require('../sockets/socketManager');
         const io = getIO();
         io.to(postId).emit('comment:new', saved);
 

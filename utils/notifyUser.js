@@ -41,7 +41,7 @@ const notifyUser = async (userId, message, type = "custom", opts = {}) => {
   //   We use the presence-aware emitToUser helper from onConnection.js so that
   //   all of a user's open tabs receive the notification.
   try {
-    const { getIO }       = require("../sockets/IOsocket");
+    const { getIO }       = require("../sockets/socketManager");
     const { emitToUser }  = require("../sockets/handlers/onConnection");
 
     const io = getIO();
@@ -112,7 +112,7 @@ const notifyMany = async (userIds, message, type = "custom", opts = {}) => {
 
   // Socket + push in parallel (non-blocking)
   try {
-    const { getIO }       = require("../sockets/IOsocket");
+    const { getIO }       = require("../sockets/socketManager");
     const { emitToUser }  = require("../sockets/handlers/onConnection");
     const { sendPushToUser } = require("./pushService");
     const io = getIO();

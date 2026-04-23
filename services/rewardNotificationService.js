@@ -113,27 +113,35 @@ async function dispatchToUser(userId, message, type, url = '/', pushPayload = nu
   }
 
   // 2 — Socket
+  let socketDelivered = false;
   try {
     const io = getIO();
+    if (!uid || uid === "undefined") {
+      console.warn("[rewardNotify] Invalid userId");
+      return null;
+    }
     io.to(uid).emit('notification', {
       _id:       notif?._id,
       type,
       message,
       url,
-      ...socketPayload,
-      createdAt: new Date(),
+      ...(socketPayload || {}),
+      createdAt: notif?.createdAt || new Date(),
     });
+    socketDelivered = true;
   } catch (err) {
     console.debug(`[rewardNotify] Socket skipped for ${uid}: ${err.message}`);
   }
 
   // 3 — Push
   try {
-    await sendPushToUser(uid, pushPayload ?? {
-      title:   'SoShoLife Rewards',
-      message,
-      url,
-    });
+    if (!socketDelivered) {
+      await sendPushToUser(uid, pushPayload ?? {
+        title:   'SoShoLife Rewards',
+        message,
+        url,
+      });
+    };
   } catch (err) {
     console.debug(`[rewardNotify] Push skipped for ${uid}: ${err.message}`);
   }

@@ -6,7 +6,7 @@ const Activity = require('../models/Activity');
 const Profile = require('../models/Profile');
 const Notification = require('../models/Notification');
 const Friendship = require('../models/Friendship');
-const { getIO } = require('../sockets/IOsocket');
+const { getIO } = require('../sockets/socketManager');
 const { sendPushToUser } = require('../utils/pushService');
 const notifyUser = require('../utils/notifyUser');
 

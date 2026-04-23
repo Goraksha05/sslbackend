@@ -20,7 +20,7 @@ const Profile = require('../models/Profile');
 const Notification = require('../models/Notification');
 const notifyUser = require('../utils/notifyUser');
 const { sendPushToUser } = require('../utils/pushService');
-const { getIO } = require('../sockets/IOsocket');
+const { getIO } = require('../sockets/socketManager');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const SUGGESTION_CACHE_TTL_MS = 1000 * 60 * 30; // 30 min (was 6h — fresher results)

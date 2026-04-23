@@ -65,7 +65,7 @@ cron.schedule('0 10 * * *', async () => {
 
         // FIX: socket wrapped in try/catch
         try {
-          const { getIO } = require('../sockets/IOsocket');
+          const { getIO } = require('../sockets/socketManager');
           getIO().to(user._id.toString()).emit('notification', {
             type:    reminderType,
             message: `⚠️ Subscription expiring in ${dayLabel}`,

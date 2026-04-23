@@ -137,8 +137,8 @@ const ALLOWED_ORIGINS = (process.env.FRONTEND_BASE_URL || '')
         'http://localhost:3001', 
         'http://127.0.0.1:3000', 
         'http://127.0.0.1:3001', 
-        'http://192.168.1.2:3000', 
-        'http://192.168.1.2:3001']
+        'http://192.168.1.3:3000', 
+        'http://192.168.1.3:3001']
       : []
   );
 
@@ -159,6 +159,7 @@ const corsOptions = {
 app.options('/{*path}', cors(corsOptions));
 app.use(cors(corsOptions));
 
+app.set('trust proxy', 1);
 // ── Static uploads — registered BEFORE compression() ─────────────────────────
 app.use(
   '/uploads',
@@ -188,7 +189,7 @@ app.use(
       const contentType = res.getHeader('Content-Type') || '';
       if (!COMPRESSIBLE_RE.test(contentType)) return false;
 
-      return compression.filter(req, res);
+      if (!res.getHeader('Content-Type')) return compression.filter(req, res);
     },
     // Compression level 6 is the default; level 1 is fastest with decent ratio.
     // For an API server where most compressed responses are JSON, level 6 is fine.
@@ -226,6 +227,10 @@ mongoose
     console.log('✅ MongoDB connected');
     require('./jobs/streakReminderJob');
     require('./jobs/subscriptionReminderJob');
+  // ── Start Server ──────────────────────────────────────────────────────────────
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 SoShoLife running on port ${PORT} [${process.env.NODE_ENV}]`);
+    });
   })
   .catch((err) => {
     console.error('❌ MongoDB connection failed:', err.message);
@@ -282,17 +287,18 @@ app.use('/api/rewards', earnedRewardsRouter);
 // FIX: skip the limiter for /api/auth/* and /api/otp/* to prevent 429s on
 // normal getuser/getloggeduser calls which happen on every page load.
 app.use('/api', (req, res, next) => {
-  if (req.path.startsWith('/auth/') || req.path.startsWith('/otp/')) return next();
+  const url = req.originalUrl;
+  if (url.startsWith('/auth/') || url.startsWith('/otp/')) return next();
   return apiLimiter(req, res, next);
 });
 
 app.use('/api/posts', require('./routes/posts'));
 app.use('/api/profile', require('./routes/profile'));
 app.use('/api/activity', require('./routes/activity'));
-app.use('/api/activity', require('./routes/redeemGrocery'));
 app.use('/api/friends', require('./routes/friends'));
 app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/payment', require('./routes/payment'));
+app.use('/api/redeem', require('./routes/redeemGrocery'));
 app.use('/api/rewards', require('./routes/userRewardSlabs'));
 // Account delete action routes:
 app.use('/api/account', require('./routes/accountDeletion'));
@@ -363,11 +369,6 @@ app.use((err, req, res, next) => {
       ? 'Something went wrong on the server.'
       : err.message,
   });
-});
-
-// ── Start Server ──────────────────────────────────────────────────────────────
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 SoShoLife running on port ${PORT} [${process.env.NODE_ENV}]`);
 });
 
 // ── Graceful Shutdown ─────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@
 
 const User = require('../models/User');
 const FraudEvent = require('../models/FraudEvent');
-const { getIO } = require('../sockets/IOsocket');
+const { getIO } = require('../sockets/socketManager');
 
 // ── Action definitions ────────────────────────────────────────────────────────
 const ACTIONS = {

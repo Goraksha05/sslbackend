@@ -45,7 +45,7 @@
  */
 
 'use strict';
-const { getIO }                   = require('../sockets/IOsocket');
+const { getIO }                   = require('../sockets/socketManager');
 const User                        = require('../models/User');
 const notifyUser                  = require('../utils/notifyUser');
 const { notifyMany }              = require('../utils/notifyUser');

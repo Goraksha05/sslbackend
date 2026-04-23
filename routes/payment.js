@@ -20,7 +20,7 @@ const router   = express.Router();
 const User         = require('../models/User');
 const fetchUser    = require('../middleware/fetchuser');
 const Notification = require('../models/Notification');
-const { getIO }         = require('../sockets/IOsocket');
+const { getIO }         = require('../sockets/socketManager');
 const { sendPushToUser } = require('../utils/pushService');
 const notifyUser         = require('../utils/notifyUser');
 

@@ -80,7 +80,7 @@ cron.schedule('0 * * * *', async () => {
           // FIX: wrap socket access in try/catch so an uninitialised IO
           // instance doesn't abort processing of remaining users.
           try {
-            const { getIO } = require('../sockets/IOsocket');
+            const { getIO } = require('../sockets/socketManager');
             getIO().to(user._id.toString()).emit('notification', { type: 'streak_reminder', message: MSG });
           } catch (socketErr) {
             // Socket not ready — push notification already handles delivery

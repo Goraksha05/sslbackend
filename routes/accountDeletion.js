@@ -27,7 +27,7 @@ const router     = express.Router();
 const fetchUser  = require('../middleware/fetchuser');
 const User       = require('../models/User');
 const Notification = require('../models/Notification');
-const { getIO }  = require('../sockets/IOsocket');
+const { getIO }  = require('../sockets/socketManager');
 
 const GRACE_DAYS = 7;
 
