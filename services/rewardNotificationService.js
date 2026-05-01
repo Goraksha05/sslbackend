@@ -1,35 +1,18 @@
 /**
  * services/rewardNotificationService.js
- *
- * USAGE
- * ─────
- *   const rn = require('./rewardNotificationService');
- *
- *   // From RewardEngine / activity routes (after successful claim):
- *   await rn.notifyRewardClaimed({ userId, userName, rewardType, milestone, planKey, amountINR, claimId });
- *
- *   // From financeAndPayoutController (after status change):
- *   await rn.notifyPayoutStatusChanged({ payoutId, userId, userName, oldStatus, newStatus, amountINR, reason });
- *
- *   // From redeemGrocery route (after submission):
- *   await rn.notifyGroceryRedemptionSubmitted({ userId, userName, amountINR, payoutId });
- *
- *   // From bulkProcess (after batch completes):
- *   await rn.notifyBulkPayoutComplete({ adminId, processed, skipped, failed, totalCashINRDispatched, totalObjectRewardsHeld, forcedToOnHoldCount });
- */
+**/
 
 'use strict';
 
-const User          = require('../models/User');
-const Notification  = require('../models/Notification');
-const AdminRole     = require('../models/AdminRole');
-const { getIO }         = require('../sockets/socketManager');
-const { sendPushToUser } = require('../utils/pushService');
+const User         = require('../models/User');
+const Notification = require('../models/Notification');
+const AdminRole    = require('../models/AdminRole');
+const { getIO }              = require('../sockets/socketManager');
+const { sendPushToUser }     = require('../utils/pushService');
+const { buildPushPayload, BRAND } = require('../utils/notifyUser');
 
 // ── Configuration ─────────────────────────────────────────────────────────────
-const HIGH_VALUE_INR_THRESHOLD = 5000; // Claims above this get an extra flag to admins
-
-// Socket room names — must match IOsocket.js
+const HIGH_VALUE_INR_THRESHOLD = 5000;
 const ADMIN_ROOM = 'admin_room';
 
 // ── Emoji / label maps ────────────────────────────────────────────────────────
@@ -84,30 +67,32 @@ async function fetchPayoutAdmins() {
   }
 }
 
-// ── Core dispatcher ───────────────────────────────────────────────────────────
+// ── Core dispatcher ────────────────────────────────────────────────────────────
 /**
- * Fire a notification to a single user across all three channels.
- * All errors are caught per-channel so one failure never blocks the others.
+ * Fire a branded notification to a single user across all three channels.
  *
- * @param {string|ObjectId} userId
- * @param {string}          message      Human-readable text
- * @param {string}          type         Notification schema enum value
- * @param {string}          [url]        Deep-link
- * @param {object}          [pushPayload] Override for web-push
- * @param {object}          [socketPayload] Extra data for socket event
+ * The SoShoLife logo is automatically included in every push notification
+ * via buildPushPayload — callers never need to pass icon/badge/image.
  */
-async function dispatchToUser(userId, message, type, url = '/', pushPayload = null, socketPayload = {}) {
+async function dispatchToUser(
+  userId,
+  message,
+  type,
+  url           = '/',
+  pushPayload   = null,
+  socketPayload = {}
+) {
   const uid = String(userId);
+
+  if (!uid || uid === 'undefined') {
+    console.warn('[rewardNotify] Invalid userId');
+    return null;
+  }
 
   // 1 — DB
   let notif = null;
   try {
-    notif = await Notification.create({
-      user:    userId,
-      message,
-      type,
-      url,
-    });
+    notif = await Notification.create({ user: userId, message, type, url });
   } catch (err) {
     console.error(`[rewardNotify] DB write failed for ${uid}:`, err.message);
   }
@@ -116,15 +101,12 @@ async function dispatchToUser(userId, message, type, url = '/', pushPayload = nu
   let socketDelivered = false;
   try {
     const io = getIO();
-    if (!uid || uid === "undefined") {
-      console.warn("[rewardNotify] Invalid userId");
-      return null;
-    }
     io.to(uid).emit('notification', {
       _id:       notif?._id,
       type,
       message,
       url,
+      icon:      BRAND.icon,   // logo in the in-app notification bell
       ...(socketPayload || {}),
       createdAt: notif?.createdAt || new Date(),
     });
@@ -133,15 +115,17 @@ async function dispatchToUser(userId, message, type, url = '/', pushPayload = nu
     console.debug(`[rewardNotify] Socket skipped for ${uid}: ${err.message}`);
   }
 
-  // 3 — Push
+  // 3 — Push (branded logo always included)
   try {
     if (!socketDelivered) {
-      await sendPushToUser(uid, pushPayload ?? {
-        title:   'SoShoLife Rewards',
-        message,
-        url,
-      });
-    };
+      // If caller supplied a pushPayload, merge logo fields into it.
+      // Otherwise build one from scratch with the logo.
+      const branded = pushPayload
+        ? { ...BRAND, ...pushPayload }           // logo is base, caller overrides
+        : buildPushPayload(BRAND.name, message, url);
+
+      await sendPushToUser(uid, branded);
+    }
   } catch (err) {
     console.debug(`[rewardNotify] Push skipped for ${uid}: ${err.message}`);
   }
@@ -150,16 +134,15 @@ async function dispatchToUser(userId, message, type, url = '/', pushPayload = nu
 }
 
 /**
- * Broadcast a notification to all payout-admin users simultaneously.
- * DB inserts are batched; socket and push fire per-admin in parallel.
- *
- * @param {string}   message
- * @param {string}   type
- * @param {string}   [url]
- * @param {object}   [socketEvent]   { event, payload } — emitted to admin_room
- * @param {object}   [pushPayload]
+ * Broadcast a branded notification to all payout-admin users simultaneously.
  */
-async function dispatchToAdmins(message, type, url = '/admin/financial', socketEvent = null, pushPayload = null) {
+async function dispatchToAdmins(
+  message,
+  type,
+  url          = '/admin/financial',
+  socketEvent  = null,
+  pushPayload  = null
+) {
   const admins = await fetchPayoutAdmins();
   if (!admins.length) return;
 
@@ -174,7 +157,7 @@ async function dispatchToAdmins(message, type, url = '/admin/financial', socketE
     console.error('[rewardNotify] Admin batch insert failed:', err.message);
   }
 
-  // Socket.IO — broadcast to the shared admin_room + each personal room
+  // Socket.IO
   try {
     const io = getIO();
 
@@ -182,13 +165,13 @@ async function dispatchToAdmins(message, type, url = '/admin/financial', socketE
       io.to(ADMIN_ROOM).emit(socketEvent.event, socketEvent.payload);
     }
 
-    // Personal room notification bell
     admins.forEach((a, i) => {
       io.to(String(a._id)).emit('notification', {
         _id:       notifications[i]?._id,
         type,
         message,
         url,
+        icon:      BRAND.icon,
         createdAt: new Date(),
       });
     });
@@ -196,55 +179,48 @@ async function dispatchToAdmins(message, type, url = '/admin/financial', socketE
     console.debug(`[rewardNotify] Admin socket skipped: ${err.message}`);
   }
 
-  // Web push in parallel (non-blocking)
-  const push = pushPayload ?? { title: 'SoShoLife Admin', message, url };
+  // Branded push
+  const branded = pushPayload
+    ? { ...BRAND, ...pushPayload }
+    : buildPushPayload('SoShoLife Admin', message, url);
+
   await Promise.allSettled(
-    admins.map(a => sendPushToUser(String(a._id), push).catch(() => {}))
+    admins.map(a => sendPushToUser(String(a._id), branded).catch(() => {}))
   );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// PUBLIC API
+// PUBLIC API  (signatures unchanged — callers need zero changes)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/**
- * User claimed a reward milestone.
- * Fires to: the claimant (confirmation) + all payout admins (action required).
- *
- * @param {object} p
- * @param {string|ObjectId} p.userId
- * @param {string}          p.userName
- * @param {'post'|'referral'|'streak'} p.rewardType
- * @param {number|string}  p.milestone    e.g. 30, "30days", 10
- * @param {string}          p.planKey     '2500' | '3500' | '4500'
- * @param {number}          p.amountINR
- * @param {string}          [p.claimId]
- */
 async function notifyRewardClaimed({
   userId, userName, rewardType, milestone, planKey, amountINR, claimId,
 }) {
-  const emoji   = TYPE_EMOJI[rewardType] || '🎁';
-  const typeStr = capitalize(rewardType);
-  const milestoneStr = rewardType === 'streak' ? `${milestone} day streak` : `${milestone} ${rewardType}s`;
+  const emoji        = TYPE_EMOJI[rewardType] || '🎁';
+  const typeStr      = capitalize(rewardType);
+  const milestoneStr = rewardType === 'streak'
+    ? `${milestone} day streak`
+    : `${milestone} ${rewardType}s`;
 
-  // ── To user (confirmation) ────────────────────────────────────────────────
+  // ── To user ───────────────────────────────────────────────────────────────
   const userMsg = `${emoji} You claimed your ${typeStr} Reward for ${milestoneStr}! ${fmtINR(amountINR)} in grocery coupons is being processed as a cash payout.`;
+
   await dispatchToUser(
     userId,
     userMsg,
     'custom',
     `/rewards/${rewardType}`,
-    {
-      title:   `${emoji} Reward Claimed!`,
-      message: `${fmtINR(amountINR)} grocery coupon cash reward for ${milestoneStr} is now in queue.`,
-      url:     `/rewards/${rewardType}`,
-    },
+    buildPushPayload(
+      `${emoji} Reward Claimed!`,
+      `${fmtINR(amountINR)} grocery coupon cash reward for ${milestoneStr} is now in queue.`,
+      `/rewards/${rewardType}`
+    ),
     { rewardType, milestone, amountINR, planKey }
   );
 
-  // ── To admins (action required) ───────────────────────────────────────────
+  // ── To admins ─────────────────────────────────────────────────────────────
   const isHighValue = typeof amountINR === 'number' && amountINR >= HIGH_VALUE_INR_THRESHOLD;
-  const adminMsg = `${emoji}${isHighValue ? ' 🔴 HIGH VALUE' : ''} New reward claim: ${userName} claimed ${fmtINR(amountINR)} (${typeStr} · ${milestoneStr} · Plan ₹${planKey})`;
+  const adminMsg    = `${emoji}${isHighValue ? ' 🔴 HIGH VALUE' : ''} New reward claim: ${userName} claimed ${fmtINR(amountINR)} (${typeStr} · ${milestoneStr} · Plan ₹${planKey})`;
 
   await dispatchToAdmins(
     adminMsg,
@@ -264,33 +240,16 @@ async function notifyRewardClaimed({
         claimedAt:  new Date(),
       },
     },
-    {
-      title:   `${emoji} New Reward Claim`,
-      message: `${userName} — ${fmtINR(amountINR)} ${typeStr} reward needs processing`,
-      url:     '/admin/financial?tab=claims',
-    }
+    buildPushPayload(
+      `${emoji} New Reward Claim`,
+      `${userName} — ${fmtINR(amountINR)} ${typeStr} reward needs processing`,
+      '/admin/financial?tab=claims'
+    )
   );
 
   console.log(`[rewardNotify] ✅ notifyRewardClaimed: user=${userId} type=${rewardType} milestone=${milestone} INR=${amountINR}`);
 }
 
-/**
- * Payout status changed (by admin action).
- * Fires to: the claimant (status update) + all payout admins (audit feed).
- *
- * @param {object} p
- * @param {string} p.payoutId
- * @param {string|ObjectId} p.userId
- * @param {string} p.userName
- * @param {string} p.oldStatus
- * @param {string} p.newStatus
- * @param {number} p.amountINR
- * @param {string} [p.rewardType]
- * @param {string} [p.milestone]
- * @param {string} [p.transactionRef]
- * @param {string} [p.failureReason]
- * @param {string} [p.adminName]
- */
 async function notifyPayoutStatusChanged({
   payoutId, userId, userName,
   oldStatus, newStatus, amountINR,
@@ -299,7 +258,9 @@ async function notifyPayoutStatusChanged({
   adminName = 'An admin',
 }) {
   const statusEmoji = STATUS_EMOJI[newStatus] || '📋';
-  const typeLabel   = rewardType ? `${TYPE_EMOJI[rewardType] || ''} ${capitalize(rewardType)}` : 'Reward';
+  const typeLabel   = rewardType
+    ? `${TYPE_EMOJI[rewardType] || ''} ${capitalize(rewardType)}`
+    : 'Reward';
 
   // ── To user ───────────────────────────────────────────────────────────────
   let userMsg = '';
@@ -309,12 +270,12 @@ async function notifyPayoutStatusChanged({
     userMsg = `${statusEmoji} Great news, ${userName.split(' ')[0]}! Your ${typeLabel} grocery coupon payout of ${fmtINR(amountINR)} has been transferred to your bank account. ${transactionRef ? `Ref: ${transactionRef}` : ''}`.trim();
     userUrl = '/rewards/history';
   } else if (newStatus === 'processing') {
-    userMsg = `${statusEmoji} Your ${typeLabel} grocery coupon cash payout of ${fmtINR(amountINR)} is now being processed. Expected within 3–5 business days. Note: Shares and tokens earned are held and will be redeemable separately.`;
+    userMsg = `${statusEmoji} Your ${typeLabel} grocery coupon cash payout of ${fmtINR(amountINR)} is now being processed. Expected within 3–5 business days.`;
   } else if (newStatus === 'failed') {
     userMsg = `${statusEmoji} Your ${typeLabel} payout of ${fmtINR(amountINR)} could not be completed. Reason: ${failureReason || 'Please contact support'}. We'll retry soon.`;
     userUrl = '/support';
   } else if (newStatus === 'on_hold') {
-    userMsg = `${statusEmoji} Your ${typeLabel} payout of ${fmtINR(amountINR)} is temporarily on hold pending additional verification. Our team will contact you.`;
+    userMsg = `${statusEmoji} Your ${typeLabel} payout of ${fmtINR(amountINR)} is temporarily on hold pending additional verification.`;
   } else if (newStatus === 'pending') {
     userMsg = `${statusEmoji} Your ${typeLabel} payout of ${fmtINR(amountINR)} has been queued for retry.`;
   }
@@ -325,16 +286,16 @@ async function notifyPayoutStatusChanged({
       userMsg,
       'custom',
       userUrl,
-      {
-        title:   `${statusEmoji} Payout ${capitalize(newStatus)}`,
-        message: userMsg,
-        url:     userUrl,
-      },
+      buildPushPayload(
+        `${statusEmoji} Payout ${capitalize(newStatus)}`,
+        userMsg,
+        userUrl
+      ),
       { payoutId, oldStatus, newStatus, amountINR, transactionRef }
     );
   }
 
-  // ── To admins (audit / feed) ──────────────────────────────────────────────
+  // ── To admins ─────────────────────────────────────────────────────────────
   const adminMsg = `${statusEmoji} Payout status: ${oldStatus} → ${newStatus} | ${userName} | ${fmtINR(amountINR)} ${typeLabel} ${milestone ? `(${milestone})` : ''} by ${adminName}`;
 
   await dispatchToAdmins(
@@ -357,40 +318,29 @@ async function notifyPayoutStatusChanged({
         changedAt:      new Date(),
       },
     },
-    {
-      title:   `${statusEmoji} Payout ${capitalize(newStatus)}`,
-      message: `${userName} — ${fmtINR(amountINR)} payout ${oldStatus} → ${newStatus}`,
-      url:     `/admin/financial?payoutId=${payoutId}`,
-    }
+    buildPushPayload(
+      `${statusEmoji} Payout ${capitalize(newStatus)}`,
+      `${userName} — ${fmtINR(amountINR)} payout ${oldStatus} → ${newStatus}`,
+      `/admin/financial?payoutId=${payoutId}`
+    )
   );
 
   console.log(`[rewardNotify] ✅ notifyPayoutStatusChanged: payout=${payoutId} ${oldStatus}→${newStatus}`);
 }
 
-/**
- * Grocery coupon redemption submitted by user.
- *
- * @param {object} p
- * @param {string|ObjectId} p.userId
- * @param {string}  p.userName
- * @param {number}  p.amountINR
- * @param {string}  p.payoutId
- */
 async function notifyGroceryRedemptionSubmitted({ userId, userName, amountINR, payoutId }) {
-  // ── To user (confirmation) ────────────────────────────────────────────────
   await dispatchToUser(
     userId,
     `🛒 Your grocery coupon redemption of ${fmtINR(amountINR)} has been received! We'll process it within 3–5 business days.`,
     'custom',
     '/rewards/history',
-    {
-      title:   '🛒 Redemption Received!',
-      message: `${fmtINR(amountINR)} grocery redemption submitted. Processing in 3–5 business days.`,
-      url:     '/rewards/history',
-    }
+    buildPushPayload(
+      '🛒 Redemption Received!',
+      `${fmtINR(amountINR)} grocery redemption submitted. Processing in 3–5 business days.`,
+      '/rewards/history'
+    )
   );
 
-  // ── To admins ─────────────────────────────────────────────────────────────
   await dispatchToAdmins(
     `🛒 New grocery redemption: ${userName} requested ${fmtINR(amountINR)} cashout. Review in Financial → Payouts.`,
     'custom',
@@ -405,34 +355,28 @@ async function notifyGroceryRedemptionSubmitted({ userId, userName, amountINR, p
         requestedAt: new Date(),
       },
     },
-    {
-      title:   '🛒 New Grocery Redemption',
-      message: `${userName} requested ${fmtINR(amountINR)} — tap to process`,
-      url:     '/admin/financial?tab=claims',
-    }
+    buildPushPayload(
+      '🛒 New Grocery Redemption',
+      `${userName} requested ${fmtINR(amountINR)} — tap to process`,
+      '/admin/financial?tab=claims'
+    )
   );
 
   console.log(`[rewardNotify] ✅ notifyGroceryRedemptionSubmitted: user=${userId} INR=${amountINR}`);
 }
 
-/**
- * Bulk payout batch completed.
- * Fires only to admins (summary of what happened).
- *
- * @param {object} p
- * @param {string}  p.adminId      The admin who ran the bulk action
- * @param {string}  p.adminName
- * @param {number}  p.processed
- * @param {number}  p.skipped
- * @param {number}  p.failed
- * @param {number}  p.totalINRDispatched
- */
-async function notifyBulkPayoutComplete({ adminId, adminName, processed, skipped, failed, totalCashINRDispatched, totalObjectRewardsHeld = {}, forcedToOnHoldCount = 0 }) {
+async function notifyBulkPayoutComplete({
+  adminId, adminName, processed, skipped, failed,
+  totalCashINRDispatched, totalObjectRewardsHeld = {}, forcedToOnHoldCount = 0,
+}) {
   const heldParts = [];
-  if (totalObjectRewardsHeld.sharesHeld > 0)        heldParts.push(`${totalObjectRewardsHeld.sharesHeld} shares`);
-  if (totalObjectRewardsHeld.referralTokenHeld > 0)  heldParts.push(`${totalObjectRewardsHeld.referralTokenHeld} tokens`);
-  const heldStr = heldParts.length > 0 ? ` | Object rewards held: ${heldParts.join(', ')}` : '';
+  if (totalObjectRewardsHeld.sharesHeld > 0)
+    heldParts.push(`${totalObjectRewardsHeld.sharesHeld} shares`);
+  if (totalObjectRewardsHeld.referralTokenHeld > 0)
+    heldParts.push(`${totalObjectRewardsHeld.referralTokenHeld} tokens`);
+  const heldStr   = heldParts.length > 0 ? ` | Object rewards held: ${heldParts.join(', ')}` : '';
   const onHoldStr = forcedToOnHoldCount > 0 ? ` | ${forcedToOnHoldCount} set to on_hold (zero cash)` : '';
+
   const msg = `⚡ Bulk payout complete by ${adminName}: ${processed} processed (${fmtINR(totalCashINRDispatched)} cash)${onHoldStr}, ${skipped} skipped, ${failed} failed${heldStr}.`;
 
   await dispatchToAdmins(
@@ -442,37 +386,21 @@ async function notifyBulkPayoutComplete({ adminId, adminName, processed, skipped
     {
       event: 'payout:bulk_complete',
       payload: {
-        adminId,
-        adminName,
-        processed,
-        skipped,
-        failed,
-        totalCashINRDispatched,
-        totalObjectRewardsHeld,
-        forcedToOnHoldCount,
-        completedAt: new Date(),
+        adminId, adminName, processed, skipped, failed,
+        totalCashINRDispatched, totalObjectRewardsHeld,
+        forcedToOnHoldCount, completedAt: new Date(),
       },
     },
-    {
-      title:   '⚡ Bulk Payout Done',
-      message: `${processed} payouts dispatched (${fmtINR(totalCashINRDispatched)} cash) — ${failed} failed`,
-      url:     '/admin/financial?tab=payouts',
-    }
+    buildPushPayload(
+      '⚡ Bulk Payout Done',
+      `${processed} payouts dispatched (${fmtINR(totalCashINRDispatched)} cash) — ${failed} failed`,
+      '/admin/financial?tab=payouts'
+    )
   );
 
-  console.log(`[rewardNotify] ✅ notifyBulkPayoutComplete: by=${adminId} processed=${processed} cashINR=${totalCashINRDispatched} heldShares=${totalObjectRewardsHeld.sharesHeld||0} heldTokens=${totalObjectRewardsHeld.referralTokenHeld||0}`);
+  console.log(`[rewardNotify] ✅ notifyBulkPayoutComplete: by=${adminId} processed=${processed} cashINR=${totalCashINRDispatched}`);
 }
 
-/**
- * User tried to claim a reward while their rewards are frozen.
- * Fires only to admins — signals a user who may need manual review.
- *
- * @param {object} p
- * @param {string|ObjectId} p.userId
- * @param {string} p.userName
- * @param {string} p.rewardType
- * @param {string|number} p.milestone
- */
 async function notifyFrozenClaimAttempt({ userId, userName, rewardType, milestone }) {
   const msg = `🔴 Frozen-account claim attempt: ${userName} tried to claim a ${capitalize(rewardType)} reward (milestone: ${milestone}) but rewards are frozen.`;
 
@@ -490,11 +418,11 @@ async function notifyFrozenClaimAttempt({ userId, userName, rewardType, mileston
         attemptAt: new Date(),
       },
     },
-    {
-      title:   '🔴 Frozen Claim Attempt',
-      message: `${userName} attempted a ${rewardType} claim — account rewards are frozen`,
-      url:     `/admin/users?userId=${String(userId)}`,
-    }
+    buildPushPayload(
+      '🔴 Frozen Claim Attempt',
+      `${userName} attempted a ${rewardType} claim — account rewards are frozen`,
+      `/admin/users?userId=${String(userId)}`
+    )
   );
 
   console.log(`[rewardNotify] ⚠️  notifyFrozenClaimAttempt: user=${userId} type=${rewardType}`);
@@ -506,8 +434,6 @@ module.exports = {
   notifyGroceryRedemptionSubmitted,
   notifyBulkPayoutComplete,
   notifyFrozenClaimAttempt,
-
-  // Expose helpers for testing / custom calls
   dispatchToUser,
   dispatchToAdmins,
   HIGH_VALUE_INR_THRESHOLD,

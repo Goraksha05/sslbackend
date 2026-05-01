@@ -21,7 +21,6 @@ const User        = require('../models/User');
 const Notification = require('../models/Notification');
 const fetchUser   = require('../middleware/fetchuser');
 const requireRewardEligibility = require('../middleware/requireRewardEligibility');
-const { handler } = require('../routes/redeemGrocery');
 const engine = require('../services/RewardEngine');
 const { RewardEngineError } = engine;
 const { getIO }         = require('../sockets/socketManager');

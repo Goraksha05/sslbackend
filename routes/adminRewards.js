@@ -1,17 +1,14 @@
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
 const { readRewards, writeRewards } = require('../utils/rewardManager');
+const { checkPermission }           = require('../middleware/rbac');
 
-// Middleware to restrict access (stubbed here — implement auth in real app)
-function isAdmin(req, res, next) {
-  if (req.user && req.user.role === 'admin') return next();
-  return res.status(403).json({ message: 'Admin access required' });
-}
+const requireRewardsPerm = checkPermission('manage_rewards');
 
 // ---------------------------
 // GET: View Reward Slabs
 // ---------------------------
-router.get('/rewards/:type/:plan', isAdmin, (req, res) => {
+router.get('/rewards/:type/:plan', requireRewardsPerm, (req, res) => {
   try {
     const { type, plan } = req.params;
     const rewards = readRewards(type, plan);
@@ -22,7 +19,7 @@ router.get('/rewards/:type/:plan', isAdmin, (req, res) => {
 });
 
 /** PUT /api/admin/rewards/:type/:plan */
-router.put('/rewards/:type/:plan', isAdmin, (req, res) => {
+router.put('/rewards/:type/:plan', requireRewardsPerm, (req, res) => {
   try {
     const { type, plan } = req.params;
     const newSlabs = req.body;

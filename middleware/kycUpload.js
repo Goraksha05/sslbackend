@@ -121,4 +121,29 @@ const kycUploadMiddleware = (req, res, next) => {
   });
 };
 
-module.exports = kycUploadMiddleware;
+const kycValidateUpload = multer({
+  storage,
+  fileFilter,
+  limits
+}).fields([
+  { name: 'aadhaar', maxCount: 1 },
+  { name: 'pan', maxCount: 1 },
+  { name: 'bank', maxCount: 1 }
+]);
+
+const kycValidateUploadMiddleware = (req, res, next) => {
+  kycValidateUpload(req, res, function (err) {
+    if (err) {
+      return res.status(400).json({
+        message: 'Upload error',
+        error: err.message
+      });
+    }
+    next();
+  });
+};
+
+module.exports = {
+  kycUploadMiddleware,
+  kycValidateUploadMiddleware
+};

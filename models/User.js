@@ -1,31 +1,4 @@
 // models/User.js
-//
-// CHANGES FROM PREVIOUS VERSION:
-//
-//   1. NEW — `banned` sub-document added.
-//      The ban/unban endpoints in adminRoutes.js write to `user.banned`.
-//      Without this declaration Mongoose stores it as unvalidated Mixed data
-//      and the `user.banned?.isBanned` guard in the ban endpoint cannot
-//      distinguish between a never-set field (undefined) and an active ban
-//      (isBanned: true).
-//
-//      Shape:
-//        banned.isBanned   {Boolean}   true while the ban is active
-//        banned.reason     {String}    optional reason (max 500 chars)
-//        banned.bannedAt   {Date}      timestamp of the ban
-//        banned.bannedBy   {ObjectId}  admin who issued the ban
-//        banned.unbannedAt {Date}      timestamp of the last lift (null if still active)
-//        banned.unbannedBy {ObjectId}  admin who lifted the ban
-//
-//      Defaults: isBanned: false so existing documents are immediately
-//      compatible — no migration script needed.
-//
-//   2. NOTE — `ban_users` permission token.
-//      This schema change does NOT require a new permission constant here,
-//      but add 'ban_users' to constants/permissions.js:
-//        PERMISSIONS.BAN_USERS = 'ban_users';
-//      and include it in any ROLE_PRESETS where you want regular admins to ban.
-//      super_admins always have it via the wildcard '*'.
 
 'use strict';
 
@@ -33,6 +6,11 @@ const mongoose = require('mongoose');
 const { Schema } = mongoose;
 
 const UserSchema = new Schema({
+  refreshToken: {
+    type: String,
+    default: null,
+  },
+
   role: {
     type:    String,
     enum:    ['user', 'admin', 'super_admin'],
@@ -88,11 +66,21 @@ const UserSchema = new Schema({
     startDate:        { type: Date },
     expiresAt:        { type: Date },
     autoRenew:        { type: Boolean, default: false },
-    activationMethod: { type: String, enum: ['paid', 'referrals', null], default: null },
+    // FIX 3: added 'special_offer_credit' — activates subscription with zero Razorpay payment
+    activationMethod: {
+      type:    String,
+      enum:    ['paid', 'referrals', 'special_offer_credit', null],
+      default: null,
+    },
     referralTarget:   { type: Number, default: 10 },
   },
 
-  activationMethod:    { type: String, enum: ['paid', 'referrals', null], default: null },
+  // FIX 4: root-level enum mirrored
+  activationMethod: {
+    type:    String,
+    enum:    ['paid', 'referrals', 'special_offer_credit', null],
+    default: null,
+  },
   referralActivatedAt: { type: Date },
   referralTarget:      { type: Number, default: 10 },
 
@@ -124,13 +112,11 @@ const UserSchema = new Schema({
   },
 
   // ── Platform Ban ──────────────────────────────────────────────────────────
-  // Written by POST /api/admin/ban-user/:id and POST /api/admin/unban-user/:id.
-  // Only admins with the 'ban_users' permission (or super_admin) may write here.
   banned: {
     isBanned: {
       type:    Boolean,
       default: false,
-      index:   true,    // indexed so banned-user queries are fast
+      index:   true,
     },
     reason:     { type: String,                         default: null },
     bannedAt:   { type: Date,                           default: null },
@@ -217,6 +203,30 @@ const UserSchema = new Schema({
     lastEvaluatedAt:   { type: Date, default: null },
     lastGraphUpdateAt: { type: Date, default: null },
   },
+
+  // ── 12-Hour Special Offer ─────────────────────────────────────────────
+  specialOffer: {
+    startAt:      { type: Date,    default: null },
+    expiresAt:    { type: Date,    default: null },
+    isActive:     { type: Boolean, default: false },
+    totalEarned:  { type: Number,  default: 0 },
+    referralCount:{ type: Number,  default: 0 },
+  },
+
+  lockedRewards: [
+    {
+      amount:         { type: Number,  required: true },
+      type:           { type: String,  default: 'special_offer' },
+      status:         {
+        type: String,
+        enum: ['pending', 'approved', 'rejected', 'used_for_subscription'],
+        default: 'pending',
+      },
+      referredUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'user', default: null },
+      payoutId:       { type: mongoose.Schema.Types.ObjectId, ref: 'Payout', default: null },
+      createdAt:      { type: Date, default: Date.now },
+    }
+  ],
 
 }, { timestamps: true });
 

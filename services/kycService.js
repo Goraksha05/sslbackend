@@ -7,7 +7,7 @@ const {
   emitKycUpdate,
   emitKycBulkUpdate,
   emitKycStatsUpdate
-} = require('../socket/kycSocket');
+} = require('../sockets/kycSocket');
 
 // CREATE
 exports.createKyc = async (userId, data) => {

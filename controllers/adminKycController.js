@@ -1,56 +1,16 @@
 /**
  * controllers/adminKycController.js
- *
- * Enhancements over previous version:
- *
- *  notifyUser integration
- *    - All calls now pass the correct (userId, message, type, opts) signature.
- *      Previously the type string was being passed as the message arg, meaning
- *      the DB record stored "kyc_submitted" as the human text and the type
- *      field defaulted to "custom" — the notification bell showed raw keys.
- *    - Every call now includes opts.pushPayload so web-push delivers a
- *      readable title + body instead of an empty notification.
- *    - opts.url is set on each notification so deep-linking works.
- *    - notifyUser return value is checked; a null return (DB failure) is
- *      logged as a warning but does not abort the KYC flow.
- *
- *  generateThumbnail integration
- *    - processFile now calls generateThumbnail as a reliable fallback when
- *      compressFile returns no thumbnail (e.g. plain image uploads where the
- *      video/PDF thumbnail path in compressFile is never reached).
- *    - generateThumbnail failures are caught per-file and logged — they never
- *      block the submission.
- *    - Thumbnail paths are stored alongside document URLs so the admin panel
- *      can render previews without re-processing files.
- *
- *  compressFile integration
- *    - processFile now surfaces the post-compression mimetype returned by
- *      compressFile. This matters when a DOCX is converted to PDF inside
- *      compressFile — the stored mimetype would otherwise still say "docx".
- *    - The returned mimetype is forwarded to generateThumbnail so it can
- *      choose the correct rendering path (image vs PDF).
- *
- *  General
- *    - notifyMany imported (available for future bulk-notification use).
- *    - All admin action handlers (approve/reject/reset) now send structured
- *      push payloads with titles and deep-link URLs.
- *    - rejectKYC now clears verifiedAt and verifiedBy when re-rejecting a
- *      previously approved record (edge case: admin reversal).
- *    - getKYCUsers now includes thumbnail URLs in the response so list views
- *      can show document previews without a second fetch.
- *    - Added exports.resetKYC — lets an admin wipe a KYC record entirely
- *      so the user can resubmit from scratch (useful for corrupted uploads).
- *    - Added exports.getKYCStats — aggregate counts per status for the
- *      admin dashboard header cards.
- */
+**/
 
 'use strict';
 const { getIO }                   = require('../sockets/socketManager');
 const User                        = require('../models/User');
+const Notification                = require('../models/Notification');
 const notifyUser                  = require('../utils/notifyUser');
 const { notifyMany }              = require('../utils/notifyUser');
 const compressFile                = require('../utils/compressFile');
 const generateThumbnail           = require('../utils/generateThumbnail');
+const { creditReferralReward }    = require('./specialOfferController');
 // const { checkLiveness }           = require('../services/livenessService');    //------------------ Temporarily disabled until the service is live
 // const { compareFaces }            = require('../services/faceMatchService');  //------------------ Temporarily disabled until the service is live
 const bus                         = require('../intelligence/platformEventBus');
@@ -357,7 +317,8 @@ exports.submitKYC = async (req, res) => {
     const finalScore = Math.min(
       baseScore
         + (faceResult.match ? 0.20 : 0)
-        + (liveness.live    ? 0.10 : 0),
+        // + (liveness.live    ? 0.10 : 0)  //------------------ Temporarily disabled until the service is live
+        ,
       1.0
     );
 
@@ -396,18 +357,18 @@ exports.submitKYC = async (req, res) => {
         aadhaar: aadhaarData,
         pan:     panData,
       },
-
-      liveness: {
-        live:   liveness.live,
-        reason: liveness.reason || null,
-      },
-
+// __________________________________________________________             
+      // liveness: {
+      //   live:   liveness.live,
+      //   reason: liveness.reason || null,                  // Temporarily store the liveness service unavailability reason in the KYC record for audit purposes. Remove this when the service is live and stable.
+      // },
+// ----------------------------------------------------------
       // faceMatch: { score: faceResult.score, matched: faceResult.match },
 
       submittedAt:     new Date(),
       verifiedAt:      kycStatus === 'verified' ? new Date() : null,
       rejectionReason: kycStatus === 'rejected'
-        ? 'Liveness check failed. Please retake your selfie in good lighting.'
+        ? 'Document verification failed. Please check your details and resubmit.'
         : null,
     };
 
@@ -418,6 +379,15 @@ exports.submitKYC = async (req, res) => {
     } else if (decision === 'reject') {
       user.trustFlags.riskTier = 'watchlist';
     }
+
+    // console.log('KYC DEBUG:', {
+    //   aadhaarData,
+    //   panData,
+    //   panApiName: panVerification.name,
+    //   userName: user.name,
+    //   baseScore,
+    //   finalScore
+    // });
 
     await user.save();
 
@@ -579,6 +549,17 @@ exports.approveKYC = async (req, res) => {
 
     await user.save();
 
+    // Trigger special-offer referral reward for the referrer (if any).
+    // BUG FIX: The original guard checked `user.kyc?.status === 'verified'`
+    // AFTER setting it to 'verified' — so it was always true, making the
+    // condition meaningless. Now we simply check `user.referral` directly,
+    // which is the actual gating condition.
+    if (user.referral) {
+      creditReferralReward(user.referral, user._id).catch(err =>
+        console.error('[specialOffer] creditReferralReward failed:', err.message)
+      );
+    }
+     
     await kycNotify(user._id, 'admin_verified');
 
     try {
@@ -812,5 +793,187 @@ exports.getMyKYC = async (req, res) => {
   } catch (err) {
     console.error('[getMyKYC]', err);
     return res.status(500).json({ message: 'Failed to fetch KYC status.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/admin/kyc/pending
+// Returns all users whose KYC status is 'submitted' (pending review).
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getPendingKyc = async (req, res) => {
+  try {
+    const users = await User.find({ 'kyc.status': 'submitted' })
+      .select('name email phone kyc.status kyc.submittedAt kyc.documents kyc.thumbnails')
+      .sort({ 'kyc.submittedAt': 1 })
+      .lean();
+ 
+    return res.json({ users });
+  } catch (err) {
+    console.error('[adminKyc] getPendingKyc error:', err);
+    return res.status(500).json({ message: 'Failed to fetch pending KYC submissions.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/admin/kyc/user/:userId
+// Returns full KYC details for a specific user.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getKycDetails = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId)
+      .select('name email phone kyc referral referralId')
+      .lean();
+ 
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+ 
+    return res.json({ user });
+  } catch (err) {
+    console.error('[adminKyc] getKycDetails error:', err);
+    return res.status(500).json({ message: 'Failed to fetch KYC details.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/admin/kyc/verify/:userId
+// Approves KYC for a user. Sets kyc.status → 'verified'.
+//
+// NEW: After approval, attempts to credit ₹100 to the user's referrer
+// via specialOfferController.creditReferralReward() if:
+//   a) The user has a referrer (user.referral is set), AND
+//   b) The referrer's 12-hour offer window is still active.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.verifyKyc = async (req, res) => {
+  try {
+    const { userId } = req.params;
+ 
+    const user = await User.findById(userId).select('kyc referral name email');
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+ 
+    if (user.kyc?.status === 'verified') {
+      return res.status(400).json({ message: 'KYC already verified.' });
+    }
+ 
+    // ── Perform verification ──────────────────────────────────────────────
+    const now = new Date();
+    user.kyc.status     = 'verified';
+    user.kyc.verifiedAt = now;
+    user.kyc.verifiedBy = req.user.id;
+    await user.save();
+ 
+    // ── Notify the user ───────────────────────────────────────────────────
+    try {
+      await Notification.create({
+        user:    userId,
+        type:    'custom',
+        message: '✅ Your KYC has been verified! You can now withdraw rewards.',
+        url:     '/rewards',
+      });
+ 
+      getIO()
+        .to(userId.toString())
+        .emit('kyc_verified', { status: 'verified' });
+    } catch (notifyErr) {
+      console.debug('[adminKyc] notification failed (non-fatal):', notifyErr.message);
+    }
+ 
+    // ── Special Offer: credit referrer if eligible ─────────────────────────
+    // This is fire-and-forget from the admin's perspective. The admin gets
+    // a 200 regardless of whether the credit succeeds.
+    if (user.referral) {
+      setImmediate(async () => {
+        try {
+          const result = await creditReferralReward(user.referral, userId);
+          if (result.credited) {
+            console.log(
+              `[adminKyc] Special offer credit: ₹${result.amount} → referrer ${user.referral} ` +
+              `(triggered by KYC verification of ${userId})`
+            );
+          } else {
+            // Not an error — offer may have expired, cap hit, etc.
+            console.debug(
+              `[adminKyc] Special offer credit skipped for referrer ${user.referral}: ${result.reason}`
+            );
+          }
+        } catch (creditErr) {
+          console.error('[adminKyc] creditReferralReward threw (non-fatal):', creditErr.message);
+        }
+      });
+    }
+ 
+    return res.json({
+      message: 'KYC verified successfully.',
+      userId,
+      verifiedAt: now,
+    });
+  } catch (err) {
+    console.error('[adminKyc] verifyKyc error:', err);
+    return res.status(500).json({ message: 'Failed to verify KYC.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/admin/kyc/reject/:userId
+// Rejects KYC for a user. Sets kyc.status → 'rejected'.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.rejectSpOfferKyc = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { reason } = req.body;
+ 
+    const user = await User.findById(userId).select('kyc name email');
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+ 
+    if (user.kyc?.status === 'rejected') {
+      return res.status(400).json({ message: 'KYC already rejected.' });
+    }
+ 
+    user.kyc.status          = 'rejected';
+    user.kyc.rejectionReason = reason ?? 'Documents could not be verified.';
+    await user.save();
+ 
+    // ── Notify the user ───────────────────────────────────────────────────
+    try {
+      await Notification.create({
+        user:    userId,
+        type:    'custom',
+        message: `❌ Your KYC was rejected. Reason: ${user.kyc.rejectionReason} Please resubmit.`,
+        url:     '/kyc',
+      });
+ 
+      getIO()
+        .to(userId.toString())
+        .emit('kyc_rejected', { status: 'rejected', reason: user.kyc.rejectionReason });
+    } catch (notifyErr) {
+      console.debug('[adminKyc] notification failed (non-fatal):', notifyErr.message);
+    }
+ 
+    return res.json({
+      message: 'KYC rejected.',
+      userId,
+      reason: user.kyc.rejectionReason,
+    });
+  } catch (err) {
+    console.error('[adminKyc] rejectKyc error:', err);
+    return res.status(500).json({ message: 'Failed to reject KYC.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/admin/kyc/stats
+// Summary counts for the admin KYC dashboard widget.
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getSpOfferKycStats = async (req, res) => {
+  try {
+    const [submitted, verified, rejected, notStarted] = await Promise.all([
+      User.countDocuments({ 'kyc.status': 'submitted' }),
+      User.countDocuments({ 'kyc.status': 'verified'  }),
+      User.countDocuments({ 'kyc.status': 'rejected'  }),
+      User.countDocuments({ 'kyc.status': { $in: ['not_started', 'required'] } }),
+    ]);
+ 
+    return res.json({ submitted, verified, rejected, notStarted });
+  } catch (err) {
+    console.error('[adminKyc] getKycStats error:', err);
+    return res.status(500).json({ message: 'Failed to fetch KYC stats.' });
   }
 };

@@ -1,14 +1,14 @@
 const { validationResult } = require('express-validator');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const Activity = require('../models/Activity');
-const Profile = require('../models/Profile');
-const Notification = require('../models/Notification');
-const Friendship = require('../models/Friendship');
-const { getIO } = require('../sockets/socketManager');
+const bcrypt        = require('bcryptjs');
+const jwt           = require('jsonwebtoken');
+const User          = require('../models/User');
+const Activity      = require('../models/Activity');
+const Profile       = require('../models/Profile');
+const Notification  = require('../models/Notification');
+const Friendship    = require('../models/Friendship');
+const { getIO }     = require('../sockets/socketManager');
 const { sendPushToUser } = require('../utils/pushService');
-const notifyUser = require('../utils/notifyUser');
+const notifyUser    = require('../utils/notifyUser');
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -100,10 +100,15 @@ exports.createUser = async (req, res) => {
       return res.status(409).json({ success: false, error: `A user with this ${field} already exists.` });
     }
 
-    // ── Create user ─────────────────────────────────────────────────────────
+    // ── Hash password ───────────────────────────────────────────────────────
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
+    
+    // ── Initialise 12-hour special offer timestamps ──────────────────────────
+    const offerStart   = new Date();
+    const offerExpires = new Date(offerStart.getTime() + 12 * 60 * 60 * 1000); // +12 h
 
+    // ── Create user ─────────────────────────────────────────────────────────
     const newUser = await User.create({
       name,
       username,
@@ -112,9 +117,20 @@ exports.createUser = async (req, res) => {
       password: hashedPassword,
       referral: referrer ? referrer._id : null,
       role:     userRole,
+      termsAccepted: true,
       isAdmin:  false,
+      specialOffer: {
+        startAt:   offerStart,
+        expiresAt: offerExpires,
+        isActive:  true,
+      },
     });
 
+    console.log(
+      `[authController] 🎁 Special offer activated for ${newUser._id} — expires ${offerExpires.toISOString()}`
+    );
+
+    
     // ── Create profile ──────────────────────────────────────────────────────
     await Profile.create({ user_id: newUser._id, followers: [], following: [] });
 
@@ -187,8 +203,6 @@ exports.createUser = async (req, res) => {
       } catch (err) {
         console.error('❌ Failed to auto-create friendship:', err.message);
       }
-
-      // Referral activation check
       await checkReferralActivation(referrer);
 
       // FIX: Record referral edge in device graph.
@@ -230,6 +244,10 @@ exports.createUser = async (req, res) => {
       },
       message: 'Account created successfully',
     });
+    // NOTE: Dead code below this point was removed.
+    // The specialOffer activation was duplicated here after a return statement
+    // and would never execute. The correct activation block lives above inside
+    // the try/catch immediately after User.create().
   } catch (error) {
     console.error('createUser error:', error);
     return res.status(500).json({ success: false, message: 'Internal Server Error' });
@@ -248,6 +266,7 @@ exports.loginUser = async (req, res) => {
   try {
     let user = null;
 
+    // ── Identify user ─────────────────────────────────────────────
     if (/^\S+@\S+\.\S+$/.test(identifier)) {
       user = await User.findOne({ email: identifier });
     } else if (/^\d{10}$/.test(identifier)) {
@@ -264,6 +283,7 @@ exports.loginUser = async (req, res) => {
       return res.status(403).json({ error: 'Role mismatch. Access denied.' });
     }
 
+    // ── Password check ────────────────────────────────────────────
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(400).json({ error: 'Invalid credentials.' });
@@ -271,6 +291,7 @@ exports.loginUser = async (req, res) => {
 
     await User.findByIdAndUpdate(user._id, { lastActive: new Date() });
 
+    // ── JWT Payload ───────────────────────────────────────────────
     const payload = {
       user: {
         id:    user._id.toString(),
@@ -279,9 +300,24 @@ exports.loginUser = async (req, res) => {
         role:  user.role,
       },
     };
-    const authtoken = signToken(payload);
 
-    // Trust & Safety: update device graph on login (fire-and-forget)
+    // ✅ Access Token (SHORT-LIVED)
+    const authtoken = jwt.sign(payload, process.env.JWT_SECRET, {
+      expiresIn: '12h',
+    });
+
+    // ✅ Refresh Token (LONG-LIVED)
+    const refreshToken = jwt.sign(
+      { user: { id: user._id.toString() } },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    // ✅ Save refresh token in DB (IMPORTANT)
+    user.refreshToken = refreshToken;
+    await user.save();
+
+    // ── Trust & Safety (unchanged) ────────────────────────────────
     const fpHash = req.headers['x-fp-hash'] || null;
     const { recordLogin } = require('../services/deviceGraphUpdater');
     const { computeMultiAccountScore } = require('../services/multiAccountScorer');
@@ -299,11 +335,12 @@ exports.loginUser = async (req, res) => {
       }
     });
 
+    // ── KYC Reminder ─────────────────────────────────────────────
     if (user.kyc?.status === 'required') {
       notifyUser(user._id, '⚠️ Please complete your KYC', 'kyc_required').catch(() => {});
     }
 
-    // Login notification (non-critical, fire-and-forget)
+    // ── Notification (unchanged) ─────────────────────────────────
     try {
       const loginNote = await Notification.create({
         user:    user._id,
@@ -311,20 +348,25 @@ exports.loginUser = async (req, res) => {
         message: `Welcome back, ${user.name}! You logged in successfully.`,
         url:     '/dashboard',
       });
+
       sendPushToUser(user._id.toString(), {
         title:   'Login Successful 🎉',
         message: `Welcome back, ${user.name}!`,
         url:     '/dashboard',
       });
+
       const io = getIO();
       io.to(user._id.toString()).emit('notification', loginNote);
+
     } catch (notifErr) {
       console.warn('Login notification failed (non-fatal):', notifErr.message);
     }
 
+    // ── Final Response ───────────────────────────────────────────
     return res.json({
-      success:   true,
+      success: true,
       authtoken: authtoken.trim(),
+      refreshToken, // ✅ IMPORTANT (frontend needs this)
       user: {
         id:           user._id,
         role:         user.role,
@@ -340,12 +382,15 @@ exports.loginUser = async (req, res) => {
         lastActive:   user.lastActive,
       },
     });
+
   } catch (error) {
     console.error('Login error:', error.stack);
-    return res.status(500).json({ success: false, message: 'Internal Server Error' });
+    return res.status(500).json({
+      success: false,
+      message: 'Internal Server Error',
+    });
   }
 };
-
 
 // ── Reset password via OTP ───────────────────────────────────────────────────
 // @route  POST /api/auth/reset-password-with-otp

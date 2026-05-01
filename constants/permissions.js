@@ -31,6 +31,13 @@ const PERMISSIONS = {
   VIEW_REPORTS:   'view_reports',
   EXPORT_REPORTS: 'export_reports',
 
+  // ── Ads / Campaigns ──────────────────────────────────────
+  // Grants access to the admin ad-moderation surface:
+  //   GET  /api/ads/admin/all
+  //   PATCH /api/ads/admin/campaign/:id/status  (approve / pause / reject)
+  // Also used to scope future per-creative moderation actions.
+  MANAGE_ADS: 'manage_ads',
+
   // ── Admin Management (super_admin only) ──────────────────
   MANAGE_ADMINS: 'manage_admins',
   MANAGE_ROLES:  'manage_roles',
@@ -68,6 +75,11 @@ const ROLE_PRESETS = {
     PERMISSIONS.BAN_USERS,
     PERMISSIONS.SUSPEND_USERS,
     PERMISSIONS.RESET_REWARDS,
+  ],
+  ads_admin: [
+    PERMISSIONS.MANAGE_ADS,
+    PERMISSIONS.VIEW_ANALYTICS,
+    PERMISSIONS.VIEW_REPORTS,
   ],
   analytics_admin: [
     PERMISSIONS.VIEW_ANALYTICS,

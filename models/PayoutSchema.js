@@ -35,7 +35,7 @@ const PayoutSchema = new Schema(
     // ── Reward metadata ───────────────────────────────────────────────────────
     rewardType: {
       type:     String,
-      enum:     ['post', 'referral', 'streak', 'grocery_redeem'],
+      enum:     ['post', 'referral', 'streak', 'grocery_redeem', 'special_offer'],
       required: true,
     },
     milestone: {

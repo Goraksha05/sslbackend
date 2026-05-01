@@ -1,14 +1,6 @@
 /**
  * routes/payment.js
- *
- * Razorpay payment routes:
- *   POST /api/payment/create-order
- *   POST /api/payment/verify
- *   GET  /api/payment/subscription-status
- *   POST /api/payment/toggle-autorenew
- *   GET  /api/payment/progress
- *   POST /api/payment/activate-by-referrals
- */
+**/
 
 'use strict';
 
@@ -20,6 +12,7 @@ const router   = express.Router();
 const User         = require('../models/User');
 const fetchUser    = require('../middleware/fetchuser');
 const Notification = require('../models/Notification');
+const Payout       = require('../models/PayoutSchema');
 const { getIO }         = require('../sockets/socketManager');
 const { sendPushToUser } = require('../utils/pushService');
 const notifyUser         = require('../utils/notifyUser');
@@ -83,6 +76,14 @@ async function dispatchSubscriptionNotifications(userId, { type, inAppMsg, pushT
   } catch (socketErr) {
     console.warn(`[payment] Socket emit failed (${type}):`, socketErr.message);
   }
+}
+
+// ── Helper: sum approved Special Offer rewards ────────────────────────────────
+function computeApprovedCredit(user) {
+  const rewards = user.lockedRewards ?? [];
+  return rewards
+    .filter(r => r.type === 'special_offer' && r.status === 'approved')
+    .reduce((sum, r) => sum + (r.amount || 0), 0);
 }
 
 /** Build a one-year-later Date from a given start Date. */
@@ -459,6 +460,296 @@ router.post('/activate-by-referrals', fetchUser, async (req, res) => {
   } catch (err) {
     console.error('[payment] activate-by-referrals error:', err);
     return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/payment/create-order-with-credit
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/create-order-with-credit', fetchUser, async (req, res) => {
+  const { planName } = req.body;
+ 
+  if (!planName || !VALID_PLANS.has(planName)) {
+    return res.status(400).json({
+      success: false,
+      error: `Invalid plan. Must be one of: ${[...VALID_PLANS].join(', ')}`,
+    });
+  }
+ 
+  try {
+    const user = await User.findById(req.user.id)
+      .select('lockedRewards subscription')
+      .lean();
+ 
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+ 
+    const planAmountINR  = PLAN_AMOUNTS[planName];
+    const creditAvailINR = computeApprovedCredit(user);
+ 
+    // Credit is capped at the plan price (user pays at least ₹1)
+    const creditAppliedINR = Math.min(creditAvailINR, planAmountINR - 1);
+    const payableINR       = planAmountINR - creditAppliedINR;
+    const payablePaise     = payableINR * 100;
+ 
+    const order = await razorpay.orders.create({
+      amount:   payablePaise,
+      currency: 'INR',
+      receipt:  `rcpt_${req.user.id.toString().slice(-8)}_${Date.now().toString(36)}`,
+      notes: {
+        userId:            req.user.id,
+        planName,
+        planAmountINR,
+        creditAppliedINR,
+        payableINR,
+      },
+    });
+ 
+    return res.status(200).json({
+      success: true,
+      order,
+      creditSummary: {
+        planName,
+        planAmountINR,
+        creditAvailableINR:  creditAvailINR,
+        creditAppliedINR,
+        payableINR,
+        savingsINR:          creditAppliedINR,
+        fullyPaidByCredit:   payableINR <= 1,
+      },
+    });
+  } catch (error) {
+    console.error('[create-order-with-credit]', error);
+    return res.status(500).json({ success: false, error: 'Order creation failed' });
+  }
+});
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/payment/verify-with-credit
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/verify-with-credit', fetchUser, async (req, res) => {
+  const {
+    razorpay_order_id,
+    razorpay_payment_id,
+    razorpay_signature,
+    planName,
+    creditAppliedINR: rawCredit,
+  } = req.body;
+ 
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ success: false, error: 'Missing payment fields' });
+  }
+  if (!planName || !VALID_PLANS.has(planName)) {
+    return res.status(400).json({ success: false, error: 'Invalid plan name' });
+  }
+ 
+  const creditApplied = Math.max(0, Number(rawCredit) || 0);
+ 
+  // ── Signature verification ─────────────────────────────────────────────────
+  const generatedSig = crypto
+    .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+    .digest('hex');
+ 
+  const sigMatch = crypto.timingSafeEqual(
+    Buffer.from(generatedSig, 'hex'),
+    Buffer.from(razorpay_signature, 'hex'),
+  );
+ 
+  if (!sigMatch) {
+    return res.status(400).json({ success: false, error: 'Invalid payment signature' });
+  }
+ 
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+ 
+    const planAmountINR   = PLAN_AMOUNTS[planName];
+    const now             = new Date();
+    const expiresAt       = oneYearFrom(now);
+    const referralTarget  = user.subscription?.referralTarget ?? user.referralTarget ?? 10;
+ 
+    // ── Mark consumed locked rewards ─────────────────────────────────────────
+    let remainingCredit = creditApplied;
+    let actualCredited  = 0;
+ 
+    if (creditApplied > 0 && Array.isArray(user.lockedRewards)) {
+      for (const r of user.lockedRewards) {
+        if (remainingCredit <= 0) break;
+        if (r.type !== 'special_offer' || r.status !== 'approved') continue;
+ 
+        const use = Math.min(r.amount, remainingCredit);
+        r.status   = 'used_for_subscription'; // custom status to mark as consumed
+        remainingCredit -= use;
+        actualCredited  += use;
+      }
+ 
+      // Update totalEarned to reflect consumed credit
+      user.specialOffer = {
+        ...(user.specialOffer?.toObject?.() ?? user.specialOffer ?? {}),
+        totalEarned: Math.max(0, (user.specialOffer?.totalEarned ?? 0) - actualCredited),
+      };
+    }
+ 
+    // ── Activate subscription ─────────────────────────────────────────────────
+    user.subscription = {
+      ...(user.subscription?.toObject?.() ?? user.subscription ?? {}),
+      plan:             planName,
+      planAmount:       planAmountINR,
+      paymentId:        razorpay_payment_id,
+      orderId:          razorpay_order_id,
+      active:           true,
+      startDate:        now,
+      expiresAt:        expiresAt,
+      autoRenew:        false,
+      activationMethod: 'paid',
+      referralTarget:   referralTarget,
+    };
+ 
+    await user.save();
+ 
+    // ── Payout ledger entry for the credit portion ────────────────────────────
+    if (actualCredited > 0) {
+      await Payout.create({
+        user:          user._id,
+        rewardType:    'special_offer',
+        milestone:     `subscription_credit_${planName}_${Date.now()}`,
+        planKey:       String(planAmountINR),
+        breakdown:     { groceryCoupons: actualCredited, shares: 0, referralToken: 0 },
+        cashAmountINR:  actualCredited,
+        totalAmountINR: actualCredited,
+        objectRewardsHeld: { sharesHeld: 0, referralTokenHeld: 0 },
+        bankDetails:   {
+          accountNumber: user.bankDetails?.accountNumber ?? null,
+          ifscCode:      user.bankDetails?.ifscCode      ?? null,
+          panNumber:     user.bankDetails?.panNumber     ?? null,
+        },
+        status:        'paid',
+        userRequested: false,
+        notes:         `Special Offer credit applied to ${planName} subscription (₹${actualCredited} of ₹${planAmountINR})`,
+        processedAt:   now,
+        paidAt:        now,
+      }).catch(err =>
+        console.error('[verify-with-credit] Payout.create non-fatal:', err.message)
+      );
+    }
+ 
+    console.log(
+      `✅ [verify-with-credit] User ${req.user.id} → ${planName} ` +
+      `(credit ₹${actualCredited}, paid ₹${planAmountINR - actualCredited})`
+    );
+ 
+    return res.status(200).json({
+      success: true,
+      message: `Payment verified. ${planName} plan activated!`,
+      plan:       planName,
+      expiresAt,
+      creditApplied: actualCredited,
+    });
+  } catch (err) {
+    console.error('[verify-with-credit]', err);
+    return res.status(500).json({ success: false, error: 'Subscription activation failed' });
+  }
+});
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/payment/activate-free-with-credit
+//
+// When creditAppliedINR >= planAmountINR the user owes ₹0 — no Razorpay order
+// is needed. This endpoint handles that fully-comped path.
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/activate-free-with-credit', fetchUser, async (req, res) => {
+  const { planName } = req.body;
+ 
+  if (!planName || !VALID_PLANS.has(planName)) {
+    return res.status(400).json({ success: false, error: 'Invalid plan name' });
+  }
+ 
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+ 
+    const planAmountINR  = PLAN_AMOUNTS[planName];
+    const creditAvail    = computeApprovedCredit(user);
+ 
+    if (creditAvail < planAmountINR) {
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient credit. Need ₹${planAmountINR}, have ₹${creditAvail}.`,
+        creditAvailable: creditAvail,
+        planAmount: planAmountINR,
+      });
+    }
+ 
+    // Mark consumed rewards
+    let remaining = planAmountINR;
+    let consumed  = 0;
+    for (const r of (user.lockedRewards ?? [])) {
+      if (remaining <= 0) break;
+      if (r.type !== 'special_offer' || r.status !== 'approved') continue;
+      const use = Math.min(r.amount, remaining);
+      r.status   = 'used_for_subscription';
+      remaining -= use;
+      consumed  += use;
+    }
+ 
+    user.specialOffer = {
+      ...(user.specialOffer?.toObject?.() ?? user.specialOffer ?? {}),
+      totalEarned: Math.max(0, (user.specialOffer?.totalEarned ?? 0) - consumed),
+    };
+ 
+    const now        = new Date();
+    const expiresAt  = oneYearFrom(now);
+    const refTarget  = user.subscription?.referralTarget ?? user.referralTarget ?? 10;
+ 
+    user.subscription = {
+      ...(user.subscription?.toObject?.() ?? user.subscription ?? {}),
+      plan:             planName,
+      planAmount:       planAmountINR,
+      active:           true,
+      startDate:        now,
+      expiresAt,
+      autoRenew:        false,
+      activationMethod: 'special_offer_credit',
+      referralTarget:   refTarget,
+    };
+ 
+    await user.save();
+ 
+    // Ledger entry
+    await Payout.create({
+      user:          user._id,
+      rewardType:    'special_offer',
+      milestone:     `full_credit_${planName}_${Date.now()}`,
+      planKey:       String(planAmountINR),
+      breakdown:     { groceryCoupons: consumed, shares: 0, referralToken: 0 },
+      cashAmountINR:  consumed,
+      totalAmountINR: consumed,
+      objectRewardsHeld: { sharesHeld: 0, referralTokenHeld: 0 },
+      bankDetails: {
+        accountNumber: user.bankDetails?.accountNumber ?? null,
+        ifscCode:      user.bankDetails?.ifscCode      ?? null,
+        panNumber:     user.bankDetails?.panNumber     ?? null,
+      },
+      status:        'paid',
+      userRequested: false,
+      notes:         `${planName} subscription activated entirely via Special Offer credit (₹${consumed})`,
+      processedAt:   now,
+      paidAt:        now,
+    }).catch(err => console.error('[activate-free-with-credit] Payout non-fatal:', err.message));
+ 
+    return res.status(200).json({
+      success: true,
+      message: `${planName} plan activated using your Special Offer rewards!`,
+      plan: planName,
+      expiresAt,
+      creditApplied: consumed,
+      paidAmount: 0,
+    });
+  } catch (err) {
+    console.error('[activate-free-with-credit]', err);
+    return res.status(500).json({ success: false, error: 'Activation failed' });
   }
 });
 
