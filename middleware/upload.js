@@ -76,10 +76,12 @@ const createUploadMiddleware = (subDir = 'profiles') => {
         },
         filename: (req, file, cb) => {
             const ext = path.extname(file.originalname);
+            const slug = base
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, '-')
+                .replace(/(^-|-$)/g, '');
             const base = path
                 .basename(file.originalname, ext)
-                .replace(/[^a-zA-Z0-9]/g, '_')
-                .toLowerCase();
             cb(null, `${Date.now()}-${base}${ext}`);
         },
     });
@@ -110,13 +112,43 @@ const uploadPostMedia = (fieldName, maxCount = 5) =>
 const uploadMultiple = (fieldName, maxCount = 5, subDir = 'profiles') =>
     createUploadMiddleware(subDir).array(fieldName, maxCount);
 
+// ── Multer Error Handlers ─────────────────────────────────────────────────────────────────
+const handleUploadError = (err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({
+      message: 'Upload error',
+      error: err.message,
+    });
+  }
+
+  if (err) {
+    return res.status(400).json({
+      message: 'Invalid upload',
+      error: err.message,
+    });
+  }
+
+  next();
+};
+// ── Cleanup utility ───────────────────────────────────────────────────────────────
+const cleanupFiles = (files) => {
+  (files || []).forEach(file => {
+    if (file?.path && fs.existsSync(file.path)) {
+      fs.unlink(file.path, () => {});
+    }
+  });
+};
+
 module.exports = {
     uploadProfile,
     uploadChatMedia,
     uploadPostMedia,
     uploadMultiple,
+    handleUploadError,
     createUploadMiddleware,
     generatePublicUrl,
     getUploadsBaseUrl,
     ALLOWED_MIME_TYPES,
+    MAX_FILE_SIZE,
+    cleanupFiles,
 };

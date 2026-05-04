@@ -270,7 +270,7 @@ app.use('/api/admin', adminRouter);
 app.use('/api/kyc', require('./routes/kycRoutes'));
 
 // Admin KYC routes:
-app.use('/api/admin-kyc', require('./routes/adminKycRoutes'));
+app.use('/api/admin/kyc', require('./routes/adminKycRoutes'));
 app.use('/api/admin/kyc-review', require('./routes/adminKycReviewRoutes'));
 
 app.use('/api/upload', require('./routes/upload'));
@@ -294,6 +294,8 @@ cron.schedule('0 20 * * *', runVectorBuilderJob);    // 02:00 IST
 cron.schedule('30 21 * * *', runGraphAlgorithmsJob);  // 03:00 IST
 cron.schedule('30 22 * * *', runNightlyRescorer);     // 04:00 IST
 
+const { runCleanup } = require('./scripts/cleanupOrphanData');
+cron.schedule('0 1 * * *', () => runCleanup({ dryRun: false })); // 06:30 IST
 
 // ── Global error handler ──────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars

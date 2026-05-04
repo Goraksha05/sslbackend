@@ -261,10 +261,24 @@ exports.submitKYC = async (req, res) => {
       1.0
     );
 
+    // NOTE: kycScoringService THRESHOLDS.MANUAL_REVIEW is set to 0.25 while
+    // face-match and liveness services are disabled.  A score of 0.30 (valid
+    // Aadhaar only) correctly routes to 'manual_review' → kycStatus='submitted'.
+    // Raise MANUAL_REVIEW back to 0.55 in kycScoringService once both services
+    // are re-enabled below.
+    let decision = getKycDecision(finalScore);
     // Hard override: liveness failure always rejects regardless of score.
     // Re-enable this line when checkLiveness is live.
-    let decision = getKycDecision(finalScore);
     // if (!liveness.live) decision = 'reject';
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('KYC DEBUG:', {
+        aadhaarData, panData,
+        panApiName: panVerification.name,
+        userName:   user.name,
+        baseScore,  finalScore, decision,
+      });
+    }
 
     const kycStatus =
       decision === 'auto_approve'  ? 'verified'  :

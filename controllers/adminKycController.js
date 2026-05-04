@@ -20,26 +20,13 @@ const {
   extractAadhaar,
   extractPAN,
 } = require('../services/kycOCRService');
+const { getKycDecision, computeKycScore } = require('../services/kycScoringService');
 
 const { verifyPAN } = require('../services/panVerificationService');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Notification messages & push payloads
 // Centralised here so every call site stays consistent and translatable later.
-// ─────────────────────────────────────────────────────────────────────────────
-// ── Notification type safety ───────────────────────────────────────────────────
-// The Notification model's `type` enum only contains values explicitly defined
-// in its schema. KYC-specific type strings like 'kyc_submitted' / 'kyc_rejected'
-// are NOT guaranteed to be in that enum unless you add them.
-// Using an unlisted value causes a Mongoose ValidationError and notifyUser()
-// returns null (DB write fails silently).
-//
-// Strategy: always pass 'custom' as the DB type (universally accepted) and put
-// the semantic label in the human-readable message. The push notification title
-// carries the full context to the user's device regardless.
-//
-// If you later add 'kyc_submitted' etc. to the Notification schema enum, simply
-// change the `type` values below — no other code needs to change.
 // ─────────────────────────────────────────────────────────────────────────────
 const KYC_NOTIFY = {
   submitted: {
@@ -150,49 +137,11 @@ function nameMatchScore(ocrName, userName) {
   return matches / Math.max(ocrTokens.length, userTokens.length);
 }
 
-function computeKycScore({ aadhaar, pan, panApiName, userName }) {
-  let score = 0;
-  if (aadhaar?.aadhaarNumber)                    score += 0.30;
-  if (pan?.panNumber)                            score += 0.20;
-  score += nameMatchScore(panApiName,      userName) * 0.25;
-  score += nameMatchScore(aadhaar?.name,   userName) * 0.25;
-  return Math.min(score, 1.0);
-}
-
-function getKycDecision(finalScore) {
-  if (finalScore >= 0.85) return 'auto_approve';
-  if (finalScore >= 0.55) return 'manual_review';
-  return 'reject';
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // processFile
-//
-// 1. Compresses the file via compressFile (resize, quality-reduce, PDF→JPEG).
-//    compressFile has its own try/catch and always returns a usable filePath,
-//    so we never 500 on compression failure.
-//
-// 2. Generates a thumbnail via generateThumbnail.
-//    - Uses the post-compression mimetype returned by compressFile (important
-//      for DOCX→PDF conversions where the extension changes inside compressFile).
-//    - Falls back gracefully: thumbnail failure is logged but never throws.
-//    - If compressFile already produced a thumbnail (video, PDF), we prefer
-//      that over calling generateThumbnail again to avoid double processing.
 // ─────────────────────────────────────────────────────────────────────────────
 // ─── Path → public URL helper ──────────────────────────────────────────────
-// Converts an absolute disk path returned by compressFile / multer into a
-// root-relative URL that the Express static middleware serves under /uploads/.
-//
-// Example (Windows):
-//   "E:\sslapp\sslbackend\uploads\kyc\69bb_aadhaar_123.jpg"
-//   → "/uploads/kyc/69bb_aadhaar_123.jpg"
-//
-// Example (Linux):
-//   "/var/www/app/uploads/kyc/69bb_aadhaar_123.jpg"
-//   → "/uploads/kyc/69bb_aadhaar_123.jpg"
-//
-// If the path doesn't contain "/uploads/" (shouldn't happen but be safe),
-// returns the input unchanged so we never crash.
 function diskPathToPublicUrl(filePath) {
   if (!filePath) return filePath;
   // Already a URL (e.g. from generateThumbnail after the fix)
@@ -216,20 +165,12 @@ async function processFile(file) {
   const mimeType = compressed.mimetype || file.mimetype;
 
   // Step 2 — thumbnail
-  // Prefer any thumbnail already produced by compressFile (video frames, PDF
-  // previews). Only call generateThumbnail when compressFile produced none.
-  //
-  // FIX: compressFile.thumbnails[0] is an absolute disk path — convert it.
-  // generateThumbnail (after the companion fix) already returns a public URL.
   let thumbnailUrl = compressed.thumbnails?.[0]
     ? diskPathToPublicUrl(compressed.thumbnails[0])
     : null;
 
   if (!thumbnailUrl) {
     try {
-      // generateThumbnail handles image/* and application/pdf; returns null
-      // for unsupported types — that's fine, we just store null.
-      // After the fix in generateThumbnail.js it returns a public URL directly.
       thumbnailUrl = await generateThumbnail(diskPath, mimeType);
     } catch (thumbErr) {
       // Non-fatal — KYC submission continues without a preview thumbnail
@@ -251,204 +192,6 @@ async function processFile(file) {
     thumbnail: thumbnailUrl || null,
   };
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 📌 USER: Submit KYC
-// ─────────────────────────────────────────────────────────────────────────────
-exports.submitKYC = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const files  = req.files;
-
-    // Defensive guard — kycUploadMiddleware should catch this first
-    if (!files?.aadhaar || !files?.pan || !files?.bank || !files?.selfie) {
-      return res.status(400).json({ message: 'All KYC documents are required.' });
-    }
-
-    // ── Step 1: Compress all files + generate thumbnails in parallel ──────────
-    const [aadhaarFile, panFile, bankFile, selfieFile] = await Promise.all([
-      processFile(files.aadhaar[0]),
-      processFile(files.pan[0]),
-      processFile(files.bank[0]),
-      processFile(files.selfie[0]),
-    ]);
-
-    // ── Step 2: Load user ─────────────────────────────────────────────────────
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ message: 'User not found.' });
-
-    if (user.kyc?.status === 'verified') {
-      return res.status(400).json({ message: 'Your KYC is already verified.' });
-    }
-
-    // ── Step 3: OCR ───────────────────────────────────────────────────────────
-    // Use diskPath (absolute filesystem path) for OCR — NOT the public URL.
-    // extractText uses Tesseract which reads from disk, not HTTP.
-    const [aadhaarText, panText] = await Promise.all([
-      extractText(aadhaarFile.diskPath),
-      extractText(panFile.diskPath),
-    ]);
-
-    const aadhaarData = extractAadhaar(aadhaarText);
-    const panData     = extractPAN(panText);
-
-    // ── Step 4: PAN API verification ──────────────────────────────────────────
-    const panVerification = panData?.panNumber
-      ? await verifyPAN(panData.panNumber)
-      : { valid: false, name: null };
-
-    // ── Step 5: Liveness check ────────────────────────────────────────────────
-    // checkLiveness uses sharp to read image metadata — needs the disk path.
-    // const liveness = await checkLiveness(selfieFile.diskPath);     //------------- Temporarily disabled until the service is live
-    const liveness = { live: true, reason: 'Liveness service not yet available' };
-
-    // ── Step 6: Face match (disabled until service is live) ───────────────────
-    // const faceResult = await compareFaces(aadhaarFile.url, selfieFile.url);
-    const faceResult = { match: false, score: null };
-
-    // ── Step 7: Score + decision ──────────────────────────────────────────────
-    const baseScore = computeKycScore({
-      aadhaar:    aadhaarData,
-      pan:        panData,
-      panApiName: panVerification.name,
-      userName:   user.name,
-    });
-
-    const finalScore = Math.min(
-      baseScore
-        + (faceResult.match ? 0.20 : 0)
-        // + (liveness.live    ? 0.10 : 0)  //------------------ Temporarily disabled until the service is live
-        ,
-      1.0
-    );
-
-    // Hard override: liveness failure always rejects regardless of score
-    let decision = getKycDecision(finalScore);
-    // if (!liveness.live) decision = 'reject';  //------------------ Temporarily disabled until the service is live
-
-    const kycStatus =
-      decision === 'auto_approve'  ? 'verified'  :
-      decision === 'manual_review' ? 'submitted' :
-      'rejected';
-
-    // ── Step 8: Persist KYC record ────────────────────────────────────────────
-    // Single assignment — avoids the "set fields then re-assign object" bug
-    // that wiped sub-fields in the original version.
-    user.kyc = {
-      status: kycStatus,
-      score:  finalScore,
-
-      documents: {
-        aadhaarFile:      aadhaarFile.url,
-        panFile:          panFile.url,
-        bankPassbookFile: bankFile.url,
-        selfie:           selfieFile.url,
-      },
-
-      // Thumbnail paths stored for admin panel previews
-      thumbnails: {
-        aadhaarThumb: aadhaarFile.thumbnail || null,
-        panThumb:     panFile.thumbnail     || null,
-        bankThumb:    bankFile.thumbnail    || null,
-        selfieThumb:  selfieFile.thumbnail  || null,
-      },
-
-      ocrData: {
-        aadhaar: aadhaarData,
-        pan:     panData,
-      },
-// __________________________________________________________             
-      // liveness: {
-      //   live:   liveness.live,
-      //   reason: liveness.reason || null,                  // Temporarily store the liveness service unavailability reason in the KYC record for audit purposes. Remove this when the service is live and stable.
-      // },
-// ----------------------------------------------------------
-      // faceMatch: { score: faceResult.score, matched: faceResult.match },
-
-      submittedAt:     new Date(),
-      verifiedAt:      kycStatus === 'verified' ? new Date() : null,
-      rejectionReason: kycStatus === 'rejected'
-        ? 'Document verification failed. Please check your details and resubmit.'
-        : null,
-    };
-
-    // ── Step 9: Trust flags ───────────────────────────────────────────────────
-    if (decision === 'auto_approve') {
-      user.trustFlags.riskTier    = 'clean';
-      user.trustFlags.kycRequired = false;
-    } else if (decision === 'reject') {
-      user.trustFlags.riskTier = 'watchlist';
-    }
-
-    // console.log('KYC DEBUG:', {
-    //   aadhaarData,
-    //   panData,
-    //   panApiName: panVerification.name,
-    //   userName: user.name,
-    //   baseScore,
-    //   finalScore
-    // });
-
-    await user.save();
-
-    // ── Step 10: Notifications + event bus ───────────────────────────────────
-    // Notifications and bus events are non-fatal — failures must never abort
-    // the KYC flow or cause a 500. bus.emit can throw when platformEventBus
-    // tries to persist to a model that doesn't exist yet (missing migration).
-    // ── Notifications + Events ───────────────────
-    await kycNotify(userId, 'submitted');
-
-    // ✅ Event Bus
-    bus.emit(bus.EVENTS.KYC_SUBMITTED, {
-      userId: String(userId),
-      decision,
-      score: finalScore,
-    });
-
-    // ✅ Realtime
-    emitKycRealtime("submitted", {
-      kycId: String(user._id),
-    });
-
-    // Auto-approved: send verified notification immediately
-    if (decision === 'auto_approve') {
-      await kycNotify(userId, 'auto_verified');
-
-      bus.emit(bus.EVENTS.KYC_VERIFIED, {
-        userId: String(userId),
-      });
-
-      emitKycRealtime("approved", {
-        kycId: String(user._id),
-      });
-    }
-
-    // Auto-rejected: send rejection notification
-    if (decision === 'reject') {
-      await kycNotify(userId, 'rejected');
-
-      bus.emit(bus.EVENTS.KYC_REJECTED, {
-        userId: String(userId),
-        reason: user.kyc.rejectionReason,
-      });
-
-      emitKycRealtime("rejected", {
-        kycId: String(user._id),
-      });
-    }
-
-    return res.json({
-      message:  'KYC processed.',
-      decision,
-      score:    finalScore,
-      status:   kycStatus,
-    });
-
-  } catch (err) {
-    console.error('[submitKYC]', err);
-    return res.status(500).json({ message: 'KYC processing failed. Please try again.' });
-  }
-};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 📌 ADMIN: List KYC submissions
@@ -759,40 +502,6 @@ exports.getKYCStats = async (req, res) => {
   } catch (err) {
     console.error('[getKYCStats]', err);
     return res.status(500).json({ message: 'Failed to fetch KYC stats.' });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 📌 USER: Get my KYC status
-// ─────────────────────────────────────────────────────────────────────────────
-exports.getMyKYC = async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id)
-      .select('kyc')
-      .lean();
-
-    if (!user) return res.status(404).json({ message: 'User not found.' });
-
-    if (!user.kyc) {
-      return res.status(404).json({ message: 'No KYC record found.' });
-    }
-
-    // Strip sensitive fields from user-facing response:
-    //   ocrData — contains raw Aadhaar/PAN numbers
-    //   thumbnails — internal file paths, not needed by the frontend
-    //   verifiedBy — internal admin ID
-    const {
-      ocrData,
-      thumbnails,
-      verifiedBy,
-      ...safeKyc
-    } = user.kyc;
-
-    return res.json(safeKyc);
-
-  } catch (err) {
-    console.error('[getMyKYC]', err);
-    return res.status(500).json({ message: 'Failed to fetch KYC status.' });
   }
 };
 

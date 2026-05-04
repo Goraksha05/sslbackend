@@ -2,7 +2,6 @@
  * services/kycScoringService.js
  *
  * KYC document scoring logic.
- * Required by adminKycController.js (was missing entirely in the original codebase).
  *
  * Scoring model:
  *   - Aadhaar number extracted        → +0.30
@@ -11,15 +10,21 @@
  *   - Aadhaar name vs user name match → up to +0.25 (proportional)
  *   Total max base score: 1.0
  *
- *   Bonuses applied by caller (adminKycController):
- *   - Face match          → +0.20
- *   - Liveness passed     → +0.10
+ *   Bonuses applied by caller (userKycController):
+ *   - Face match          → +0.20  (currently disabled — service not live)
+ *   - Liveness passed     → +0.10  (currently disabled — service not live)
  *   Grand total cap: 1.0
  *
  * Decision thresholds:
  *   >= 0.85  → auto_approve
- *   >= 0.55  → manual_review
- *   <  0.55  → reject
+ *   >= 0.25  → manual_review   ← lowered from 0.55 while face-match/liveness
+ *                                  are disabled; a valid Aadhaar alone (0.30)
+ *                                  is enough for human review rather than
+ *                                  instant rejection.
+ *   <  0.25  → reject          ← only truly empty / unreadable submissions
+ *
+ * IMPORTANT: Raise MANUAL_REVIEW back to 0.55 (and AUTO_APPROVE stays at 0.85)
+ * once checkLiveness and compareFaces are re-enabled in userKycController.js.
  */
 
 'use strict';
@@ -51,9 +56,20 @@ function nameMatchScore(a, b) {
   const setB   = new Set(tokB);
   const common = tokA.filter(t => setB.has(t)).length;
 
-  // Jaccard-style: intersect / union
-  const union = new Set([...tokA, ...tokB]).size;
-  return common / union;
+  // Jaccard-style: intersect / union   // Count each token in both arrays independently
+  const countTokens = (toks) => toks.reduce((m, t) => (m.set(t, (m.get(t) || 0) + 1), m), new Map());
+  const countA = countTokens(tokA);
+  const countB = countTokens(tokB);
+  const allKeys = new Set([...countA.keys(), ...countB.keys()]);
+
+  let intersect = 0, unionCount = 0;
+  for (const k of allKeys) {
+    const a = countA.get(k) || 0;
+    const b = countB.get(k) || 0;
+    intersect  += Math.min(a, b);
+    unionCount += Math.max(a, b);
+  }
+  return unionCount === 0 ? 0 : intersect / unionCount;
 }
 
 // ── Main scorer ───────────────────────────────────────────────────────────────
@@ -94,7 +110,11 @@ function computeKycScore({ aadhaar, pan, panApiName, userName }) {
 // ── Decision ──────────────────────────────────────────────────────────────────
 const THRESHOLDS = {
   AUTO_APPROVE:   0.85,
-  MANUAL_REVIEW:  0.55,
+  // Lowered from 0.55 → 0.25 while face-match (+0.20) and liveness (+0.10)
+  // services are disabled.  A user who successfully uploads a readable Aadhaar
+  // scores 0.30 and must land in manual_review, not auto-rejected.
+  // Restore to 0.55 once both services are re-enabled in userKycController.js.
+  MANUAL_REVIEW:  0.25,
 };
 
 /**
