@@ -1,12 +1,14 @@
-// routes/payoutRoutes.js  (UPDATED)
+// routes/payoutRoutes.js  (FIXED)
 // ─────────────────────────────────────────────────────────────────────────────
 // Payout management routes for the admin panel.
 //
-// CHANGES:
-//   NEW — GET /api/admin/payouts/report           getPayoutReport
-//   NEW — GET /api/admin/payouts/user-requested   listUserRequestedPayouts
+// FIX: GET /payouts/special-offer-report moved into the static-segment block.
+//      It was previously declared after the /:payoutId dynamic routes and was
+//      therefore unreachable — Express would match /payouts/special-offer-report
+//      against /payouts/user/:userId or let it fall through entirely.
 //
-// Route order: all static-segment routes BEFORE dynamic /:payoutId routes.
+// Rule: every fixed-string path segment must be registered before any route
+//       that introduces a dynamic segment (/:param) at the same position.
 // ─────────────────────────────────────────────────────────────────────────────
 
 'use strict';
@@ -26,6 +28,7 @@ const {
   bulkProcessPayouts,
   listUnredeemedWallets,
   getPayoutReport,
+  getSpecialOfferReport,
 } = require('../controllers/financeAndPayoutController');
 
 const requirePayoutPerm = checkPermission('manage_payouts');
@@ -40,14 +43,20 @@ router.get('/payouts/summary', requirePayoutPerm, getPayoutSummary);
 router.get('/payouts/pending-claims', requirePayoutPerm, listPendingClaims);
 
 // GET /api/admin/payouts/user-requested
-// NEW: Lists only user-initiated grocery redemption requests (userRequested:true).
+// Lists only user-initiated grocery redemption requests (userRequested:true).
 // These are the payouts admin is responsible for paying.
 router.get('/payouts/user-requested', requirePayoutPerm, listUserRequestedPayouts);
 
 // GET /api/admin/payouts/report
-// NEW: Full payout report with bank details — data for Excel download.
+// Full payout report with bank details — data for Excel download.
 // Query: format=all|paid|pending, rewardType, from, to, userRequested
 router.get('/payouts/report', requirePayoutPerm, getPayoutReport);
+
+// GET /api/admin/payouts/special-offer-report
+// FIXED: moved here from below the dynamic routes where it was unreachable.
+// Full Special Offer payout report: rows[], summary{}, total, generated.
+// Query: format=all|paid|pending, path=credit|withdrawal, status, from, to, userId
+router.get('/payouts/special-offer-report', requirePayoutPerm, getSpecialOfferReport);
 
 // GET /api/admin/payouts/unredeemed-wallets
 // Shows users with wallet balance who haven't submitted a redemption request.
@@ -68,7 +77,7 @@ router.get('/payouts/user/:userId', requirePayoutPerm, getUserPayouts);
 // PATCH /api/admin/payouts/:payoutId/status
 router.patch('/payouts/:payoutId/status', requirePayoutPerm, updatePayoutStatus);
 
-// GET /api/admin/payouts — paginated list (broadest match — last)
+// GET /api/admin/payouts — paginated list
 router.get('/payouts', requirePayoutPerm, listPayouts);
 
 module.exports = router;

@@ -219,7 +219,7 @@ const UserSchema = new Schema({
       type:           { type: String,  default: 'special_offer' },
       status:         {
         type: String,
-        enum: ['pending', 'approved', 'rejected', 'used_for_subscription'],
+        enum: ['pending', 'approved', 'rejected', 'used_for_subscription', 'paid_as_withdrawal', 'withdrawn'],
         default: 'pending',
       },
       referredUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'user', default: null },

@@ -76,13 +76,12 @@ const createUploadMiddleware = (subDir = 'profiles') => {
         },
         filename: (req, file, cb) => {
             const ext = path.extname(file.originalname);
+            const base = path.basename(file.originalname, ext);
             const slug = base
                 .toLowerCase()
                 .replace(/[^a-z0-9]+/g, '-')
                 .replace(/(^-|-$)/g, '');
-            const base = path
-                .basename(file.originalname, ext)
-            cb(null, `${Date.now()}-${base}${ext}`);
+            cb(null, `${Date.now()}-${slug}${ext}`);
         },
     });
 

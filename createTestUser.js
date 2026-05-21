@@ -59,6 +59,16 @@ const PLAN_KEY           = '2500';
 const PLAN_NAME          = 'Basic';
 const PLAN_AMOUNT        = 2500;
 
+/**
+ * Universal / platform referral ID — mirrors authController.js.
+ *
+ * When this ID is supplied at registration no referrer is linked and none of
+ * the referral side-effects fire.  Used here so the sponsor user can be
+ * created independently of any pre-existing referral chain, exactly as
+ * ordinary visitors who arrive without a ?ref= URL param would.
+ */
+const UNIVERSAL_REFERRAL_ID = 'GK531980';
+
 // Reward milestones (must match postsRewards.json / streakRewards.json / referralRewards.json)
 const STREAK_MILESTONE   = 30;
 const POSTS_MILESTONE    = 30;
@@ -208,6 +218,57 @@ async function upsertUser(fields) {
   return user;
 }
 
+/**
+ * Resolve a referrer document from a referral code string.
+ *
+ * Mirrors the exact logic in authController.createUser:
+ *   1. If the DB is empty (totalUsers === 0) — no referral code is required;
+ *      returns null so the caller sets referral: null.
+ *   2. If the code is the UNIVERSAL_REFERRAL_ID — treated as a platform
+ *      sign-up (no referrer); returns null without any DB lookup.
+ *   3. Otherwise — looks up the user whose referralId matches the code and
+ *      returns their document.  Throws if the code is not found so seed
+ *      failures are loud and obvious.
+ *
+ * @param {string|null} referralno   The referral code to resolve.
+ * @returns {Promise<import('mongoose').Document|null>}
+ */
+async function resolveReferrer(referralno) {
+  const totalUsers = await User.countDocuments();
+
+  // Rule 1: first user ever — no referral needed
+  if (totalUsers === 0) {
+    info('No existing users — referral code not required for first registration.');
+    return null;
+  }
+
+  const normalised = String(referralno || '').trim().toUpperCase();
+
+  // Rule 2: universal / platform referral code → no referrer linked
+  if (normalised === UNIVERSAL_REFERRAL_ID) {
+    info(`Universal referral ID (${UNIVERSAL_REFERRAL_ID}) used — no referrer will be linked.`);
+    return null;
+  }
+
+  // Rule 3: real referral code — must match an existing user
+  if (!normalised) {
+    throw new Error(
+      'No referral code provided and DB is non-empty. ' +
+      `Either supply a valid referralId or use the universal code "${UNIVERSAL_REFERRAL_ID}".`
+    );
+  }
+
+  const referrer = await User.findOne({ referralId: normalised });
+  if (!referrer) {
+    throw new Error(
+      `Invalid referral ID "${normalised}" — no user found with this referralId. ` +
+      'Check the code or use the universal platform code.'
+    );
+  }
+
+  return referrer;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -226,10 +287,20 @@ async function main() {
 
   // ══════════════════════════════════════════════════════════════════════════
   // STEP 1 — Create the sponsor user
-  //          Required because registration demands a valid referralId once
-  //          any users exist in the DB.
+  //
+  // The sponsor is the user whose referralId the test user will supply at
+  // "sign-up".  We create the sponsor first and pass their generated
+  // referralId to the test user's referral field.
+  //
+  // Referral resolution for the SPONSOR itself:
+  //   • If the DB is empty (first run on a fresh DB) → no referral needed.
+  //   • Otherwise → use the UNIVERSAL_REFERRAL_ID so the sponsor is created
+  //     without being linked to any real user, matching what a visitor who
+  //     lands directly on the site (no ?ref= param) would do.
   // ══════════════════════════════════════════════════════════════════════════
   section('Step 1 — Create sponsor user');
+
+  const sponsorReferrer = await resolveReferrer(UNIVERSAL_REFERRAL_ID);
 
   const sponsorPw = await hashPw(TEST_PASSWORD);
   const sponsor   = await upsertUser({
@@ -240,20 +311,42 @@ async function main() {
     password:     sponsorPw,
     role:         'user',
     isAdmin:      false,
+    // sponsorReferrer is null when UNIVERSAL_REFERRAL_ID is used — correct.
+    referral:     sponsorReferrer ? sponsorReferrer._id : null,
     kyc:          verifiedKyc(),
     subscription: activeSubscription(),
     trustFlags:   cleanTrustFlags(),
   });
   success(`Sponsor created  → _id: ${sponsor._id}  referralId: ${sponsor.referralId}`);
+  info(`Sponsor referralId "${sponsor.referralId}" will be used as the test user's referral code.`);
 
   // ══════════════════════════════════════════════════════════════════════════
   // STEP 2 — Create the primary test user
-  //          specialOffer is initialised atomically inside the create call,
-  //          matching the fix in authController.js that eliminated the race
-  //          condition where the frontend could read the status before the
-  //          separate findByIdAndUpdate() had written the offer fields.
+  //
+  // Referral resolution:
+  //   • We now have the sponsor in the DB, so totalUsers > 0.
+  //   • We pass the sponsor's auto-generated referralId to resolveReferrer().
+  //   • resolveReferrer() finds the sponsor document and returns it.
+  //   • testUser.referral is set to sponsor._id — matching what authController
+  //     does when a real user signs up with a valid referral code.
+  //
+  // specialOffer is initialised atomically inside the create call, matching
+  // the fix in authController.js that eliminated the race condition where
+  // the frontend could read the status before the separate findByIdAndUpdate()
+  // had written the offer fields.
   // ══════════════════════════════════════════════════════════════════════════
   section('Step 2 — Create primary test user');
+
+  const testUserReferrer = await resolveReferrer(sponsor.referralId);
+  if (!testUserReferrer) {
+    // This should never happen because we just created the sponsor, but
+    // guard loudly so any future schema change surfaces clearly.
+    throw new Error(
+      `Could not resolve sponsor referralId "${sponsor.referralId}". ` +
+      'Ensure the sponsor was saved correctly in Step 1.'
+    );
+  }
+  success(`Referral resolved → ${testUserReferrer.name} (${testUserReferrer._id})`);
 
   const offerMode = NO_OFFER ? 'none' : (EXPIRED ? 'expired' : 'active');
   // The offer will accumulate 1 pending + 1 approved locked reward below,
@@ -269,7 +362,7 @@ async function main() {
     password:     testPw,
     role:         'user',
     isAdmin:      false,
-    referral:     sponsor._id,
+    referral:     testUserReferrer._id,
 
     // ── KYC + subscription gates ───────────────────────────────────────────
     kyc:          verifiedKyc(),
@@ -279,8 +372,8 @@ async function main() {
     trustFlags:   cleanTrustFlags(),
 
     bankDetails: {
-      accountNumber: '123456789012',
-      ifscCode:      'SBIN0001234',
+      accountNumber: '34911897638',
+      ifscCode:      'SBIN0000536',
       panNumber:     'ABCDE1234F',
     },
 
@@ -357,6 +450,12 @@ async function main() {
 
   // ══════════════════════════════════════════════════════════════════════════
   // STEP 5 — Seed 3 referred users with active subscriptions
+  //
+  // Each referred user is created with testUser._id as their referral field.
+  // Their own referral field (who referred them) is set to the test user's
+  // referralId — matching what authController does for a normal sign-up.
+  // The UNIVERSAL_REFERRAL_ID path is NOT used here because we genuinely
+  // want these users linked to the test user for the referral milestone check.
   // ══════════════════════════════════════════════════════════════════════════
   section(`Step 5 — Seed ${REFERRAL_MILESTONE} referred users`);
 
@@ -371,6 +470,8 @@ async function main() {
       password:     pw,
       role:         'user',
       isAdmin:      false,
+      // These users were referred by the test user — set referral to testUser._id
+      // (authController resolves the referral code to an ObjectId before storing).
       referral:     testUser._id,
       kyc:          verifiedKyc(),
       subscription: activeSubscription(),
@@ -407,6 +508,11 @@ async function main() {
   //
   // These are separate from the standard referred users above so the counts
   // are clean (standard referral milestone uses referredIds, not these).
+  //
+  // Both users are linked to the test user via referral: testUser._id,
+  // exactly as authController links referred users.  The UNIVERSAL_REFERRAL_ID
+  // is NOT used here because we need the referral chain for Special Offer
+  // credit logic (creditReferralReward checks user.referral).
   //
   // Skipped when --no-offer is passed.
   // ══════════════════════════════════════════════════════════════════════════
@@ -632,6 +738,7 @@ async function main() {
   console.log(`║  Password   : ${TEST_PASSWORD}                               ║`);
   console.log(`║  User ID    : ${testUser._id}                                ║`);
   console.log(`║  ReferralId : ${(testUser.referralId ?? '(auto-generated)').padEnd(16)} (use in new signups)  ║`);
+  console.log(`║  Referred by: ${sponsor.referralId.padEnd(16)} (sponsor)                      ║`);
   console.log('╠══════════════════════════════════════════════════════════════╣');
   console.log('║  CLAIMABLE MILESTONES (nothing pre-claimed)                  ║');
   console.log(`║   • Streak   30-day  → ₹500 grocery coupons                  ║`);
@@ -673,6 +780,11 @@ async function main() {
   console.log('║   4. Activity → Referrals → claim "3 Referrals" reward       ║');
   console.log('║   5. To test Razorpay: log out, sign up a new account using  ║');
   console.log(`║      referralId ${(testUser.referralId ?? 'shown above').padEnd(16)}, then go to /subscription ║`);
+  console.log('║                                                               ║');
+  console.log('║  REFERRAL CODE BEHAVIOUR (mirrors authController.js)         ║');
+  console.log(`║   Universal code "${UNIVERSAL_REFERRAL_ID}" → no referrer linked (platform)  ║`);
+  console.log('║   Any valid referralId  → user is linked to that referrer    ║');
+  console.log('║   Empty / invalid code  → registration is rejected           ║');
   console.log('╚══════════════════════════════════════════════════════════════╝');
   console.log('');
 

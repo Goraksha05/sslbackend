@@ -14,6 +14,24 @@ const notifyUser    = require('../utils/notifyUser');
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
+/**
+ * Universal / platform referral ID.
+ *
+ * When a new user signs up without being referred by any existing user they
+ * are expected to supply this ID instead of a blank field.  Using this ID:
+ *   • satisfies the "referral code required" gate so the registration flow
+ *     works without a real referrer
+ *   • sets referral: null on the new User document (no referrer credit)
+ *   • skips all referral side-effects (notifications, friendship, graph edge,
+ *     special-offer credit, referral-activation check) — none of those make
+ *     sense for a platform-owned account
+ *
+ * The frontend pre-fills the signup form with this value when no ?ref= URL
+ * param is present, so ordinary visitors never see an error about a missing
+ * referral code.
+ */
+const UNIVERSAL_REFERRAL_ID = 'GK531980';
+
 // FIX: Removed hardcoded fallback secret — if JWT_SECRET is missing the app
 // should fail loudly at startup, not silently use an insecure default.
 if (!JWT_SECRET) {
@@ -75,13 +93,29 @@ exports.createUser = async (req, res) => {
     let referrer = null;
     const totalUsers = await User.countDocuments();
     if (totalUsers > 0) {
-      if (!referralno) {
+      // ------- Use for Universal Referral ID -------- //
+      const normalised = String(referralno || '').trim().toUpperCase();
+      if (!normalised) {
         return res.status(400).json({
           success: false,
-          message: 'Referral code required. Please ask your friend to share their ID.',
+          message: 'Referral code required. Please enter a referral ID or use the default platform code.',
         });
       }
-      referrer = await User.findOne({ referralId: String(referralno).trim().toUpperCase() });
+      // ----------------------------------------------------------------------------------//
+
+      // if (!referralno) {
+      //   return res.status(400).json({
+      //     success: false,
+      //     message: 'Referral code required. Please ask your friend to share their ID.',
+      //   });
+      // }
+      // referrer = await User.findOne({ referralId: String(referralno).trim().toUpperCase() });
+
+    // ------- Use for Universal Referral ID -------- //  
+      if (normalised !== UNIVERSAL_REFERRAL_ID) {
+        // Real referral ID — must belong to an existing user.
+        referrer = await User.findOne({ referralId: normalised });
+    //-------------------------------------------------//
       if (!referrer) {
         return res.status(400).json({
           success: false,
@@ -89,6 +123,7 @@ exports.createUser = async (req, res) => {
         });
       }
     }
+  } // ------- Use for Universal Referral ID -------- //
 
     // ── Duplicate check ─────────────────────────────────────────────────────
     const existingUser = await User.findOne({ $or: [{ email }, { phone }, { username }] });

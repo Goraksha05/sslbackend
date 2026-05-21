@@ -17,8 +17,10 @@ const router    = express.Router();
 const fetchUser = require('../middleware/fetchuser');
 const ctrl      = require('../controllers/specialOfferController');
 
-router.get('/status',          fetchUser, ctrl.getStatus);
-router.get('/locked-rewards',  fetchUser, ctrl.getLockedRewards);
-router.post('/withdraw',       fetchUser, ctrl.withdraw);
+router.get('/status',               fetchUser, ctrl.getStatus);
+router.get('/locked-rewards',       fetchUser, ctrl.getLockedRewards);
+router.post('/request-withdrawal',  fetchUser, ctrl.requestWithdrawal);
+router.post('/withdrawal-preview',  fetchUser, ctrl.getWithdrawalPreview);
+router.post('/withdraw',            fetchUser, ctrl.withdraw);
 
 module.exports = router;

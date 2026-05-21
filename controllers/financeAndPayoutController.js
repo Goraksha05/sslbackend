@@ -225,43 +225,58 @@ exports.listPendingClaims = async (req, res) => {
     const limit = Math.min(100, parseInt(req.query.limit) || 25);
     const skip  = (page - 1) * limit;
 
-    // Claims that already have a payout
-    const processedClaimIds = await Payout.distinct('rewardClaim', { rewardClaim: { $ne: null } });
-
-    const claimFilter = { _id: { $nin: processedClaimIds } };
     const VALID_TYPES = ['post', 'referral', 'streak', 'grocery_redeem'];
-    if (req.query.type && VALID_TYPES.includes(req.query.type)) {
-      claimFilter.type = req.query.type;
-    }
+    const typeFilter  = req.query.type && VALID_TYPES.includes(req.query.type)
+      ? req.query.type
+      : null;
 
-    // For grocery_redeem: only show user-requested payouts
-    // Find claim IDs that correspond to user-requested pending payouts
-    let groceryRedeemFilter = null;
-    if (!req.query.type || req.query.type === 'grocery_redeem') {
-      // Get RewardClaim IDs where corresponding Payout has userRequested:true
-      const userRequestedPayoutClaimIds = await Payout.distinct('rewardClaim', {
+    // ── Step 1: claim IDs that already have ANY payout (exclude from results) ─
+    // FIX: Payout.rewardClaim is sparse (may be null).  Using distinct() can
+    // return null values when the field is absent, which then fail a Mongoose
+    // CastError when placed into { $nin: [...null] } on an ObjectId _id field.
+    // Use $ne: null in the distinct filter AND strip nulls from the result to
+    // be safe even if the index returns unexpected values.
+    const rawProcessed = await Payout.distinct('rewardClaim', {
+      rewardClaim: { $ne: null },
+    });
+    const processedClaimIds = rawProcessed.filter(Boolean);   // strip any null/undefined
+
+    // ── Step 2: build the base filter ─────────────────────────────────────────
+    // FIX: Build _id exclusion once and never overwrite it.  The previous code
+    // overwrote claimFilter._id with { $in: pendingUserReqClaimIds } for the
+    // grocery_redeem branch, silently dropping the $nin exclusion and returning
+    // already-processed claims.  Now we combine both constraints with $and.
+    const claimFilter = {};
+    if (typeFilter) claimFilter.type = typeFilter;
+
+    // ── Step 3: grocery_redeem — show only claims tied to pending user-requests
+    // For the grocery_redeem type, the claim is only "actionable" when:
+    //   a) a corresponding Payout exists with userRequested: true, AND
+    //   b) that payout is still in an open status (pending/processing/on_hold)
+    // All other claim types: exclude claims that already have any payout.
+    if (typeFilter === 'grocery_redeem') {
+      // Only show grocery claims with an active user-requested payout
+      const pendingUserReqClaimIds = await Payout.distinct('rewardClaim', {
         rewardType:    'grocery_redeem',
         userRequested: true,
+        status:        { $in: ['pending', 'processing', 'on_hold'] },
         rewardClaim:   { $ne: null },
       });
-      // Grocery claims that have been requested AND don't have a completed payout
-      // We want claims of type grocery_redeem that ARE linked to a user-requested payout
-      // but that payout is still pending/processing
-      if (req.query.type === 'grocery_redeem') {
-        // Show only grocery claims that have a pending user-requested payout
-        const pendingUserReqClaimIds = await Payout.distinct('rewardClaim', {
-          rewardType:    'grocery_redeem',
-          userRequested: true,
-          status:        { $in: ['pending', 'processing', 'on_hold'] },
-          rewardClaim:   { $ne: null },
-        });
-        claimFilter._id = { $in: pendingUserReqClaimIds };
+      const validIds = pendingUserReqClaimIds.filter(Boolean);
+      // $in an empty array returns zero results — correct behaviour (no pending requests)
+      claimFilter._id = { $in: validIds };
+    } else {
+      // Non-grocery types: exclude claims that have already been processed
+      claimFilter._id = { $nin: processedClaimIds };
+      // Also exclude grocery_redeem from the general list (it has its own tab)
+      if (!typeFilter) {
+        claimFilter.type = { $nin: ['grocery_redeem'] };
       }
     }
 
     const [claims, total] = await Promise.all([
       RewardClaim.find(claimFilter)
-        .populate('user', 'name email phone username subscription bankDetails kyc trustFlags')
+        .populate({ path: 'user', model: User, select: 'name email phone username subscription bankDetails kyc trustFlags' })
         .sort({ claimedAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -531,7 +546,7 @@ exports.processPayout = async (req, res) => {
       paidAt:        finalStatus === 'paid' ? new Date() : null,
     });
 
-    rn.notifyPayoutStatusChange({
+    rn.notifyPayoutStatusChanged({
       userId:    user._id,
       userName:  user.name || user.username,
       amountINR: cashAmountINR,
@@ -608,7 +623,7 @@ exports.updatePayoutStatus = async (req, res) => {
     const updatedPayout = await Payout.findByIdAndUpdate(payoutId, { $set: updates }, { new: true })
       .populate({ path: 'user', model: User, select: 'name email phone username subscription bankDetails kyc.status' });
 
-    rn.notifyPayoutStatusChange({
+    rn.notifyPayoutStatusChanged({
       userId:        payout.user?._id,
       userName:      payout.user?.name || payout.user?.email,
       amountINR:     payout.cashAmountINR ?? payout.totalAmountINR,
@@ -744,7 +759,7 @@ exports.bulkProcessPayouts = async (req, res) => {
       processed:  results.processed.length,
       skipped:    results.skipped.length,
       failed:     results.failed.length,
-      totalINRDispatched: totalCashINR,
+      totalCashINRDispatched: totalCashINR,
     }).catch(() => {});
 
     return res.status(207).json({
@@ -952,6 +967,218 @@ exports.listUnredeemedWallets = async (req, res) => {
   } catch (err) {
     console.error('[listUnredeemedWallets]', err);
     return res.status(500).json({ message: 'Failed to fetch unredeemed wallets' });
+  }
+};
+
+const TDS_RATE = 0.10; // must match specialOfferController.js
+
+/**
+ * Parse TDS amount from payout notes string if available.
+ * Notes format from specialOfferController:
+ *   "TDS deducted (10% under Section 194R): ₹<n>"
+ * Falls back to computing 10% of gross if not found.
+ *
+ * @param {string} notes
+ * @param {number} grossINR
+ * @returns {number}
+ */
+function parseTdsFromNotes(notes, grossINR) {
+  if (!notes) return Math.round(grossINR * TDS_RATE);
+  const match = notes.match(/TDS deducted[^:]*:\s*₹?(\d+)/i);
+  if (match) return parseInt(match[1], 10) || 0;
+  return Math.round(grossINR * TDS_RATE);
+}
+
+/**
+ * Determine the redemption path chosen by the user (post-approval).
+ * Withdrawal payouts have userRequested: true.
+ * Credit payouts that were used for subscription have a milestone containing
+ * 'subscription_credit' or their lockedReward status is 'used_for_subscription'.
+ *
+ * @param {object} payout  — Payout document (lean)
+ * @returns {'credit'|'withdrawal'|'subscription'|'pending_choice'}
+ */
+function classifyPath(payout) {
+  if (payout.userRequested) return 'withdrawal';
+  const milestone = String(payout.milestone || '');
+  if (milestone.includes('subscription_credit') || milestone.includes('full_credit')) {
+    return 'subscription';
+  }
+  // Admin-credited reward, user hasn't yet chosen their redemption path
+  if (['pending', 'processing'].includes(payout.status)) return 'pending_choice';
+  if (payout.status === 'paid') return 'credit_paid';
+  return 'credit';
+}
+
+exports.getSpecialOfferReport = async (req, res) => {
+  try {
+    const { Payout }    = require('../models/PayoutSchema') ? { Payout: require('../models/PayoutSchema') } : {};
+    const User          = require('../models/User');
+    const PayoutModel   = require('../models/PayoutSchema');
+
+    const MAX = 5000;
+
+    // ── Build filter ──────────────────────────────────────────────────────────
+    const filter = { rewardType: 'special_offer' };
+
+    // Status
+    const VALID_STATUSES = ['pending', 'processing', 'paid', 'failed', 'on_hold'];
+    const formatParam = req.query.format || 'all';
+    if (formatParam === 'paid')    filter.status = 'paid';
+    if (formatParam === 'pending') filter.status = { $in: ['pending', 'processing'] };
+    if (req.query.status && VALID_STATUSES.includes(req.query.status)) {
+      filter.status = req.query.status;
+    }
+
+    // Path → userRequested boolean
+    if (req.query.path === 'credit')     filter.userRequested = false;
+    if (req.query.path === 'withdrawal') filter.userRequested = true;
+
+    // User
+    const mongoose = require('mongoose');
+    if (req.query.userId && mongoose.Types.ObjectId.isValid(req.query.userId)) {
+      filter.user = new mongoose.Types.ObjectId(req.query.userId);
+    }
+
+    // Date range
+    if (req.query.from || req.query.to) {
+      filter.createdAt = {};
+      if (req.query.from) filter.createdAt.$gte = new Date(req.query.from);
+      if (req.query.to)   filter.createdAt.$lte = new Date(req.query.to);
+    }
+
+    // ── Query ─────────────────────────────────────────────────────────────────
+    const payouts = await PayoutModel.find(filter)
+      .populate({
+        path:   'user',
+        model:  User,
+        select: 'name email phone username referralId subscription bankDetails kyc.status kyc.verifiedAt trustFlags lockedRewards specialOffer',
+      })
+      .populate({ path: 'processedBy', model: User, select: 'name email' })
+      .sort({ createdAt: -1 })
+      .limit(MAX)
+      .lean();
+
+    // ── Build rows ────────────────────────────────────────────────────────────
+    const rows = payouts.map(p => {
+      const u   = p.user   || {};
+      const bd  = p.bankDetails || {};
+      const ub  = u.bankDetails || {};
+
+      // Amount breakdown
+      const grossINR = p.breakdown?.groceryCoupons ?? p.totalAmountINR ?? p.cashAmountINR ?? 0;
+      const isWithdrawal = !!p.userRequested;
+
+      // For withdrawal payouts the TDS was embedded in notes by specialOfferController
+      const tdsINR = isWithdrawal ? parseTdsFromNotes(p.notes, grossINR) : 0;
+      const netINR = p.cashAmountINR ?? p.totalAmountINR ?? 0;
+
+      // Path classification
+      const path = classifyPath(p);
+
+      // Find the matching lockedReward entry to surface its status
+      const referredUserId = p.milestone
+        ? p.milestone.replace('special_offer_referral_', '').replace('special_offer_withdrawal_', '').replace('subscription_credit_', '').replace('full_credit_', '').replace(/_\d+$/, '')
+        : null;
+
+      const lockedReward = (u.lockedRewards ?? []).find(r =>
+        r.type === 'special_offer' &&
+        (referredUserId ? String(r.referredUserId) === referredUserId : true)
+      );
+      const lockedStatus = lockedReward?.status ?? p.status;
+
+      // Subscription usage
+      const subCreditApplied = path === 'subscription' || lockedStatus === 'used_for_subscription';
+      const specialOfferActive = u.specialOffer?.isActive && new Date() < new Date(u.specialOffer?.expiresAt || 0);
+
+      return {
+        // ── Payout identity ──────────────────────────────────────────────────
+        payoutId:          String(p._id),
+        path,                                          // 'credit' | 'withdrawal' | 'subscription' | 'pending_choice' | 'credit_paid'
+        pathLabel:         isWithdrawal ? 'Cash Withdrawal (Path B)' : 'Subscription Credit (Path A)',
+        userRequested:     isWithdrawal ? 'Yes' : 'No',
+        status:            p.status,
+        lockedRewardStatus: lockedStatus,
+        milestone:         String(p.milestone || ''),
+        planKey:           p.planKey || '',
+        processedBy:       p.processedBy?.name || p.processedBy?.email || '',
+        transactionRef:    p.transactionRef || '',
+        failureReason:     p.failureReason  || '',
+        notes:             p.notes || '',
+
+        // ── Financial ────────────────────────────────────────────────────────
+        grossINR,                                      // total credited (before TDS)
+        tdsINR,                                        // 10% TDS on withdrawals, 0 on credits
+        netINR,                                        // amount user receives (gross - TDS for withdrawals)
+        tdsPercent:        isWithdrawal ? '10%' : 'N/A',
+        subCreditApplied:  subCreditApplied ? 'Yes' : 'No',
+
+        // ── Lifecycle dates ──────────────────────────────────────────────────
+        createdAt:         p.createdAt    ? new Date(p.createdAt).toLocaleString('en-IN',    { timeZone: 'Asia/Kolkata' }) : '',
+        processedAt:       p.processedAt  ? new Date(p.processedAt).toLocaleString('en-IN',  { timeZone: 'Asia/Kolkata' }) : '',
+        paidAt:            p.paidAt       ? new Date(p.paidAt).toLocaleString('en-IN',       { timeZone: 'Asia/Kolkata' }) : '',
+
+        // ── User details ─────────────────────────────────────────────────────
+        userName:          u.name     || '',
+        userEmail:         u.email    || '',
+        userPhone:         u.phone    || '',
+        userUsername:      u.username || '',
+        userReferralId:    u.referralId || '',
+        userPlan:          u.subscription?.plan       || '',
+        userPlanAmount:    u.subscription?.planAmount || '',
+        userSubActive:     u.subscription?.active ? 'Yes' : 'No',
+        userSubExpires:    u.subscription?.expiresAt ? new Date(u.subscription.expiresAt).toLocaleDateString('en-IN') : '',
+        userKycStatus:     u.kyc?.status || '',
+        userKycVerifiedAt: u.kyc?.verifiedAt ? new Date(u.kyc.verifiedAt).toLocaleDateString('en-IN') : '',
+        userRewardsFrozen: u.trustFlags?.rewardsFrozen ? 'Yes' : 'No',
+        userRiskTier:      u.trustFlags?.riskTier || 'clean',
+        specialOfferActive: specialOfferActive ? 'Yes' : 'No',
+        offerExpiresAt:    u.specialOffer?.expiresAt ? new Date(u.specialOffer.expiresAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : '',
+        totalEarnedINR:    u.specialOffer?.totalEarned || 0,
+        referralCount:     u.specialOffer?.referralCount || 0,
+
+        // ── Bank details ─────────────────────────────────────────────────────
+        // Payout snapshot first (immutable at request time), then live user data
+        bankAccountNumber: bd.accountNumber || ub.accountNumber || '',
+        bankIfscCode:      bd.ifscCode      || ub.ifscCode      || '',
+        bankPanNumber:     bd.panNumber     || ub.panNumber     || '',
+      };
+    });
+
+    // ── Aggregate summary ─────────────────────────────────────────────────────
+    const summary = {
+      totalRows:          rows.length,
+
+      // Credits (admin-created rewards)
+      creditsTotal:       rows.filter(r => r.userRequested === 'No').length,
+      creditsPendingCount:rows.filter(r => r.userRequested === 'No' && ['pending', 'processing'].includes(r.status)).length,
+      creditsPendingINR:  rows.filter(r => r.userRequested === 'No' && ['pending', 'processing'].includes(r.status)).reduce((s, r) => s + r.grossINR, 0),
+      creditsPaidINR:     rows.filter(r => r.userRequested === 'No' && r.status === 'paid').reduce((s, r) => s + r.grossINR, 0),
+      subCreditsUsedINR:  rows.filter(r => r.subCreditApplied === 'Yes').reduce((s, r) => s + r.grossINR, 0),
+
+      // Withdrawals (user-requested cash payouts)
+      withdrawalsTotal:    rows.filter(r => r.userRequested === 'Yes').length,
+      withdrawalsGrossINR: rows.filter(r => r.userRequested === 'Yes').reduce((s, r) => s + r.grossINR, 0),
+      withdrawalsTdsINR:   rows.filter(r => r.userRequested === 'Yes').reduce((s, r) => s + r.tdsINR, 0),
+      withdrawalsNetINR:   rows.filter(r => r.userRequested === 'Yes').reduce((s, r) => s + r.netINR, 0),
+      withdrawalsPaidINR:  rows.filter(r => r.userRequested === 'Yes' && r.status === 'paid').reduce((s, r) => s + r.netINR, 0),
+      withdrawalsPendingINR: rows.filter(r => r.userRequested === 'Yes' && ['pending', 'processing'].includes(r.status)).reduce((s, r) => s + r.netINR, 0),
+
+      // All-time
+      totalGrossINR:      rows.reduce((s, r) => s + r.grossINR, 0),
+      totalTdsINR:        rows.reduce((s, r) => s + r.tdsINR,   0),
+      totalNetINR:        rows.reduce((s, r) => s + r.netINR,   0),
+      failedCount:        rows.filter(r => r.status === 'failed').length,
+
+      generatedAt:        new Date().toISOString(),
+      filter: { status: req.query.status || '', path: req.query.path || '', from: req.query.from || '', to: req.query.to || '', userId: req.query.userId || '' },
+    };
+
+    return res.json({ rows, summary, total: rows.length, generated: new Date().toISOString() });
+
+  } catch (err) {
+    console.error('[getSpecialOfferReport]', err);
+    return res.status(500).json({ message: 'Failed to generate Special Offer report' });
   }
 };
 
